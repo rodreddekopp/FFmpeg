@@ -582,8 +582,8 @@ int mux_check_init(void *arg)
             return (int)seek_ret;
         }
 
-        trunc_ret = avio_truncate(fc->pb, target);
-        if (trunc_ret == AVERROR(ENOSYS) && fc->url && fc->url[0])
+        trunc_ret = AVERROR(ENOSYS);
+        if (fc->url && fc->url[0])
             trunc_ret = ffmpeg_truncate_output_tail(fc->url, target);
 
         if (trunc_ret < 0 && trunc_ret != AVERROR(ENOSYS)) {
