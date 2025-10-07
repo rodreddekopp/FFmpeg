@@ -18,7 +18,20 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
+
+#include <errno.h>
 #include <string.h>
+
+#if HAVE_UNISTD_H
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "cmdutils.h"
 #include "ffmpeg.h"
@@ -64,6 +77,45 @@ static int check_opt_bitexact(void *ctx, const AVDictionary *opts,
         return !!(val & flag);
     }
     return 0;
+}
+
+static int truncate_output_tail(const char *filename, int64_t size)
+{
+    if (size < 0)
+        return AVERROR(EINVAL);
+
+#if HAVE_TRUNC
+    if (truncate(filename, (off_t)size) < 0)
+        return AVERROR(errno);
+    return 0;
+#elif defined(_WIN32)
+    int fd = _open(filename, _O_RDWR | _O_BINARY);
+    int ret;
+
+    if (fd < 0)
+        return AVERROR(errno);
+
+#if defined(_WIN32) && !defined(__MINGW32__)
+    ret = _chsize_s(fd, size);
+    if (ret) {
+        ret = AVERROR(errno);
+        _close(fd);
+        return ret;
+    }
+#else
+    ret = _chsize(fd, size);
+    if (ret) {
+        ret = AVERROR(errno);
+        _close(fd);
+        return ret;
+    }
+#endif
+
+    _close(fd);
+    return 0;
+#else
+    return AVERROR(ENOSYS);
+#endif
 }
 
 static int choose_encoder(const OptionsContext *o, AVFormatContext *s,
@@ -3383,7 +3435,7 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
             int truncate_ret;
             int64_t seek_ret;
 
-            truncate_ret = avio_truncate(oc->pb, of->recovery.file_size);
+            truncate_ret = truncate_output_tail(filename, of->recovery.file_size);
             if (truncate_ret < 0 && truncate_ret != AVERROR(ENOSYS)) {
                 av_log(mux, AV_LOG_WARNING,
                        "Unable to truncate %s to %"PRId64" bytes: %s\n",

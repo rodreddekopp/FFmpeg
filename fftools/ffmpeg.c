@@ -26,6 +26,7 @@
 #include "config.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -74,6 +75,7 @@
 #include "libavutil/file.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
+#include "libavutil/timestamp.h"
 
 #include "libavformat/avformat.h"
 
@@ -458,9 +460,9 @@ static int recovery_parse_checkpoint(OutputFile *of, char *content,
             int file_idx = 0;
             int stream_idx = 0;
             int64_t pts_us = AV_NOPTS_VALUE;
-            unsigned long long frames = 0;
+            uint64_t frames = 0;
 
-            if (sscanf(line, "IST %d %d %"SCNd64" %"SCNu64,
+            if (sscanf(line, "IST %d %d %" SCNd64 " %" SCNu64,
                        &file_idx, &stream_idx, &pts_us, &frames) == 4) {
                 if (file_idx >= 0 && file_idx < nb_input_files) {
                     InputFile *f = input_files[file_idx];
