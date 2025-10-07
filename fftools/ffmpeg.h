@@ -686,6 +686,8 @@ typedef struct OutputFile {
         int     append;
         int64_t file_size;
         int64_t progress_us;
+        int64_t elapsed_us;
+        uint64_t last_frame;
     } recovery;
 } OutputFile;
 
@@ -828,7 +830,8 @@ void fg_send_command(FilterGraph *fg, double time, const char *target,
 int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch);
 
 int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flags);
-void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us, int64_t progress_us);
+void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
+                              int64_t progress_us, int64_t elapsed_us);
 
 void enc_stats_write(OutputStream *ost, EncStats *es,
                      const AVFrame *frame, const AVPacket *pkt,

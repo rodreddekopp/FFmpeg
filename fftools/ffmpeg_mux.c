@@ -61,6 +61,24 @@ static int64_t filesize(AVIOContext *pb)
     return ret;
 }
 
+int ffmpeg_mux_checkpoint_flush(OutputFile *of)
+{
+    Muxer *mux = mux_from_of(of);
+    AVFormatContext *fc;
+
+    if (!mux)
+        return 0;
+
+    fc = mux->fc;
+    if (!fc || !fc->pb || (fc->oformat->flags & AVFMT_NOFILE))
+        return 0;
+
+    avio_flush(fc->pb);
+    atomic_store(&mux->last_filesize, filesize(fc->pb));
+
+    return 0;
+}
+
 static void mux_log_debug_ts(OutputStream *ost, const AVPacket *pkt)
 {
     static const char *desc[] = {

@@ -149,6 +149,7 @@ case "$mode" in
         crash_log="$outdir/ffmpeg-recovery-crash.log"
         resume_log="$outdir/ffmpeg-recovery-resume.log"
         finish_log="$outdir/ffmpeg-recovery-finish.log"
+        pattern="FFRECOVPAD"
         rm -f "$output" "$sidecar" "$crash_log" "$resume_log" "$finish_log"
 
         "$ffmpeg_exec" -hide_banner -loglevel info -nostdin -stats_period 0.1 \
@@ -177,9 +178,22 @@ case "$mode" in
             exit 1
         fi
 
+        crash_elapsed=$(awk -F= '/^elapsed_us=/{print $2}' "$sidecar" | head -n1)
+        if [ -z "$crash_elapsed" ] || [ "$crash_elapsed" -le 0 ]; then
+            echo "crash_checkpoint=timing"
+            exit 1
+        fi
+
         crash_frame=$(awk '/^OST /{print $4}' "$sidecar" | sort -n | tail -n1)
         if [ -z "$crash_frame" ] || [ "$crash_frame" -le 0 ]; then
             echo "crash_checkpoint=empty"
+            exit 1
+        fi
+
+        printf '%s%s' "$pattern" "$pattern" >>"$output"
+        tampered_size=$(get_size "$output")
+        if [ "$tampered_size" -le "$crash_size" ]; then
+            echo "truncate=no"
             exit 1
         fi
 
@@ -198,6 +212,36 @@ case "$mode" in
 
         if ! grep -q 'Loaded recovery checkpoint' "$resume_log"; then
             echo "resume=no-checkpoint"
+            exit 1
+        fi
+
+        resume_chkpt_line=$(grep -m1 'chkpt=' "$resume_log" || true)
+        if [ -z "$resume_chkpt_line" ]; then
+            echo "checkpoint_status=missing"
+            exit 1
+        fi
+        resume_chkpt=$(printf '%s' "$resume_chkpt_line" | sed -E 's/.*chkpt=([^ ]+).*/\1/')
+        if ! printf '%s' "$resume_chkpt" | grep -Eq '^[0-9]+$'; then
+            echo "checkpoint_status=value"
+            exit 1
+        fi
+        if [ "$resume_chkpt" -ne "$crash_frame" ]; then
+            echo "checkpoint_status=mismatch"
+            exit 1
+        fi
+
+        resume_fps_line=$(awk '/Loaded recovery checkpoint/{flag=1; next} flag && /fps=/{print; exit}' "$resume_log")
+        if [ -z "$resume_fps_line" ]; then
+            echo "fps_resume=missing"
+            exit 1
+        fi
+        resume_fps=$(printf '%s' "$resume_fps_line" | sed -E 's/.*fps= *([0-9.]+).*/\1/')
+        if [ -z "$resume_fps" ]; then
+            echo "fps_resume=missing"
+            exit 1
+        fi
+        if ! awk -v fps="$resume_fps" 'BEGIN{exit !(fps > 0 && fps < 120)}'; then
+            echo "fps_resume=range"
             exit 1
         fi
 
@@ -228,6 +272,17 @@ case "$mode" in
             exit 1
         fi
 
+        resume_elapsed=$(awk -F= '/^elapsed_us=/{print $2}' "$sidecar" | head -n1)
+        if [ -z "$resume_elapsed" ] || [ "$resume_elapsed" -le "$crash_elapsed" ]; then
+            echo "resume=elapsed"
+            exit 1
+        fi
+
+        if grep -a -q "$pattern" "$output"; then
+            echo "truncate=no"
+            exit 1
+        fi
+
         "$ffmpeg_exec" -hide_banner -loglevel info -nostdin -stats_period 0.1 \
             -auto_recovery -recovery_interval 0.2 \
             -re -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 90 \
@@ -250,10 +305,19 @@ case "$mode" in
             exit 1
         fi
 
+        if grep -a -q "$pattern" "$output"; then
+            echo "truncate=no"
+            exit 1
+        fi
+
         echo "crash_checkpoint=ok"
         echo "frame_resume=ok"
         echo "probe=ok"
         echo "resume=ok"
+        echo "resume_elapsed=ok"
+        echo "checkpoint_status=ok"
+        echo "fps_resume=ok"
+        echo "truncate=ok"
         echo "checkpoint=clean"
         ;;
     *)

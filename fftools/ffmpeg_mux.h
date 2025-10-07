@@ -122,6 +122,7 @@ typedef struct Muxer {
 } Muxer;
 
 int ffmpeg_truncate_output_tail(const char *filename, int64_t size);
+int ffmpeg_mux_checkpoint_flush(OutputFile *of);
 int mux_check_init(void *arg);
 
 static inline MuxStream *ms_from_ost(OutputStream *ost)
