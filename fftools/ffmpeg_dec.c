@@ -181,6 +181,10 @@ static int dec_alloc(DecoderPriv **pdec, Scheduler *sch, int send_end_ts)
 
     dp->index                        = -1;
     dp->dec.class                    = &dec_class;
+    atomic_init(&dp->dec.frames_decoded, 0);
+    atomic_init(&dp->dec.samples_decoded, 0);
+    atomic_init(&dp->dec.decode_errors, 0);
+    atomic_init(&dp->dec.last_pts_us, AV_NOPTS_VALUE);
     dp->last_filter_in_rescale_delta = AV_NOPTS_VALUE;
     dp->last_frame_pts               = AV_NOPTS_VALUE;
     dp->last_frame_tb                = (AVRational){ 1, 1 };
@@ -278,6 +282,10 @@ static void audio_ts_process(DecoderPriv *dp, AVFrame *frame)
     frame->pts       = av_rescale_q(frame->pts, tb, tb_filter);
     frame->duration  = frame->nb_samples;
     frame->time_base = tb_filter;
+
+    if (frame->pts != AV_NOPTS_VALUE)
+        atomic_store(&dp->dec.last_pts_us,
+                     av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q));
 }
 
 static int64_t video_duration_estimate(const DecoderPriv *dp, const AVFrame *frame)
@@ -416,6 +424,10 @@ static int video_frame_process(DecoderPriv *dp, AVFrame *frame,
     dp->last_frame_duration_est = video_duration_estimate(dp, frame);
     dp->last_frame_pts          = frame->pts;
     dp->last_frame_tb           = frame->time_base;
+
+    if (frame->pts != AV_NOPTS_VALUE)
+        atomic_store(&dp->dec.last_pts_us,
+                     av_rescale_q(frame->pts, frame->time_base, AV_TIME_BASE_Q));
 
     if (debug_ts) {
         av_log(dp, AV_LOG_INFO,
@@ -669,7 +681,7 @@ static int transcode_subtitles(DecoderPriv *dp, const AVPacket *pkt,
     if (ret < 0) {
         av_log(dp, AV_LOG_ERROR, "Error decoding subtitles: %s\n",
                av_err2str(ret));
-        dp->dec.decode_errors++;
+        atomic_fetch_add(&dp->dec.decode_errors, 1);
         return exit_on_error ? ret : 0;
     }
 
@@ -736,7 +748,7 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
         if (ret == AVERROR_EOF)
             return ret;
 
-        dp->dec.decode_errors++;
+        atomic_fetch_add(&dp->dec.decode_errors, 1);
         if (exit_on_error)
             return ret;
     }
@@ -758,7 +770,7 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             return ret;
         } else if (ret < 0) {
             av_log(dp, AV_LOG_ERROR, "Decoding error: %s\n", av_err2str(ret));
-            dp->dec.decode_errors++;
+            atomic_fetch_add(&dp->dec.decode_errors, 1);
 
             if (exit_on_error)
                 return ret;
@@ -788,8 +800,7 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
         frame->time_base = dec->pkt_timebase;
 
         if (dec->codec_type == AVMEDIA_TYPE_AUDIO) {
-            dp->dec.samples_decoded += frame->nb_samples;
-
+            atomic_fetch_add(&dp->dec.samples_decoded, frame->nb_samples);
             audio_ts_process(dp, frame);
         } else {
             ret = video_frame_process(dp, frame, &outputs_mask);
@@ -800,7 +811,7 @@ static int packet_decode(DecoderPriv *dp, AVPacket *pkt, AVFrame *frame)
             }
         }
 
-        dp->dec.frames_decoded++;
+        atomic_fetch_add(&dp->dec.frames_decoded, 1);
 
         for (int i = 0; i < stdc_count_ones(outputs_mask); i++) {
             AVFrame *to_send = frame;
@@ -1006,8 +1017,12 @@ static int decoder_thread(void *arg)
         }
         ret = 0;
 
-        err_rate = (dp->dec.frames_decoded || dp->dec.decode_errors) ?
-                   dp->dec.decode_errors / (dp->dec.frames_decoded + dp->dec.decode_errors) : 0.f;
+        {
+            uint64_t frames = atomic_load(&dp->dec.frames_decoded);
+            uint64_t errors = atomic_load(&dp->dec.decode_errors);
+            err_rate = (frames || errors) ?
+                       (double)errors / (frames + errors) : 0.f;
+        }
         if (err_rate > max_error_rate) {
             av_log(dp, AV_LOG_FATAL, "Decode error rate %g exceeds maximum %g\n",
                    err_rate, max_error_rate);

@@ -83,6 +83,10 @@ char *print_graphs_format = NULL;
 int auto_conversion_filters = 1;
 int64_t stats_period = 500000;
 
+int recovery_enabled = 0;
+int recovery_resume_enabled = 1;
+int64_t recovery_interval = 300LL * AV_TIME_BASE;
+
 
 static int file_overwrite     = 0;
 static int no_file_overwrite  = 0;
@@ -1623,6 +1627,15 @@ const OptionDef options[] = {
     { "progress",               OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
         { .func_arg = opt_progress },
       "write program-readable progress information", "url" },
+    { "auto_recovery",          OPT_TYPE_BOOL, OPT_EXPERT,
+        { &recovery_enabled },
+        "periodically persist encoder recovery checkpoints" },
+    { "auto_resume",            OPT_TYPE_BOOL, OPT_EXPERT,
+        { &recovery_resume_enabled },
+        "resume from available recovery checkpoints" },
+    { "recovery_interval",      OPT_TYPE_TIME, OPT_EXPERT,
+        { &recovery_interval },
+        "time between automatic recovery snapshots", "duration" },
     { "stdin",                  OPT_TYPE_BOOL, OPT_EXPERT,
         { &stdin_interaction },
       "enable or disable interaction on standard input" },

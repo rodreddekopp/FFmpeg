@@ -68,8 +68,10 @@
 #include <conio.h>
 #endif
 
+#include "libavutil/avstring.h"
 #include "libavutil/bprint.h"
 #include "libavutil/dict.h"
+#include "libavutil/file.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -114,6 +116,15 @@ int        nb_filtergraphs;
 Decoder     **decoders;
 int        nb_decoders;
 
+typedef struct RecoveryState {
+    int     active;
+    int     resume_attempted;
+    int64_t interval_us;
+    int64_t last_update_wallclock_us;
+} RecoveryState;
+
+static RecoveryState recovery_state = { 0 };
+
 #if HAVE_TERMIOS_H
 
 /* init terminal so that we can grab keys */
@@ -138,6 +149,12 @@ void term_exit(void)
 static volatile int received_sigterm = 0;
 static volatile int received_nb_signals = 0;
 static atomic_int transcode_init_done = 0;
+static atomic_uintptr_t transcoding_scheduler = ATOMIC_VAR_INIT(0);
+static atomic_int transcode_paused = 0;
+#ifdef SIGUSR2
+static atomic_int pause_toggle_pending = ATOMIC_VAR_INIT(0);
+static void sigusr2_handler(int sig);
+#endif
 static volatile int ffmpeg_exited = 0;
 static int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
 
@@ -236,6 +253,9 @@ void term_init(void)
 
     SIGNAL(SIGINT , sigterm_handler); /* Interrupt (ANSI).    */
     SIGNAL(SIGTERM, sigterm_handler); /* Termination (ANSI).  */
+#ifdef SIGUSR2
+    SIGNAL(SIGUSR2, sigusr2_handler); /* User-defined signal toggles pause. */
+#endif
 #ifdef SIGXCPU
     SIGNAL(SIGXCPU, sigterm_handler);
 #endif
@@ -307,8 +327,343 @@ static int decode_interrupt_cb(void *ctx)
 
 const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
 
+static int recovery_path_supported(const char *url)
+{
+    const char *ignored;
+
+    if (!url || !*url)
+        return 0;
+
+    if (av_strstart(url, "pipe:", &ignored) ||
+        av_strstart(url, "fd:", &ignored))
+        return 0;
+
+    if (strstr(url, "://"))
+        return 0;
+
+    return 1;
+}
+
+static char *recovery_build_path(const char *url)
+{
+    static const char suffix[] = ".ffrecovery";
+    size_t len;
+    char *path;
+
+    if (!url)
+        return NULL;
+
+    len = strlen(url);
+    path = av_malloc(len + sizeof(suffix));
+    if (!path)
+        return NULL;
+
+    memcpy(path, url, len);
+    memcpy(path + len, suffix, sizeof(suffix));
+
+    return path;
+}
+
+static int recovery_load_file(const char *path, char **data_out, size_t *size_out)
+{
+    uint8_t *mapped = NULL;
+    size_t mapped_size = 0;
+    int ret;
+
+    ret = av_file_map(path, &mapped, &mapped_size, 0, NULL);
+    if (ret < 0)
+        return ret;
+
+    if (mapped_size > (1 << 20)) {
+        av_file_unmap(mapped, mapped_size);
+        return AVERROR(EINVAL);
+    }
+
+    *data_out = av_malloc(mapped_size + 1);
+    if (!*data_out) {
+        av_file_unmap(mapped, mapped_size);
+        return AVERROR(ENOMEM);
+    }
+
+    memcpy(*data_out, mapped, mapped_size);
+    (*data_out)[mapped_size] = '\0';
+    *size_out = mapped_size;
+
+    av_file_unmap(mapped, mapped_size);
+
+    return 0;
+}
+
+static void recovery_apply_seeks(void)
+{
+    for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
+        InputFile *f;
+        int64_t target_ts;
+        int ret;
+
+        if (ist->recovery_target_pts_us == AV_NOPTS_VALUE)
+            continue;
+
+        f = ist->file;
+        if (!f || !f->ctx)
+            continue;
+
+        target_ts = av_rescale_q(ist->recovery_target_pts_us,
+                                  AV_TIME_BASE_Q, ist->st->time_base);
+
+        ret = avformat_seek_file(f->ctx, ist->index, INT64_MIN,
+                                 target_ts, target_ts, AVSEEK_FLAG_BACKWARD);
+        if (ret < 0) {
+            av_log(ist, AV_LOG_WARNING,
+                   "Failed to seek for recovery on input #%d:%d: %s\n",
+                   f->index, ist->index, av_err2str(ret));
+        } else {
+            av_log(ist, AV_LOG_INFO,
+                   "Recovered input #%d:%d to %s\n",
+                   f->index, ist->index,
+                   av_ts2timestr(target_ts, &ist->st->time_base));
+            avformat_flush(f->ctx);
+        }
+
+        ist->recovery_target_pts_us = AV_NOPTS_VALUE;
+    }
+}
+
+static int recovery_parse_checkpoint(OutputFile *of, char *content,
+                                     int64_t *file_size_out,
+                                     int64_t *progress_us_out)
+{
+    char *saveptr = NULL;
+    char *line;
+    int got_magic = 0;
+    int64_t file_size = -1;
+    int64_t progress_us = AV_NOPTS_VALUE;
+
+    while ((line = av_strtok(got_magic ? NULL : content, "\r\n", &saveptr))) {
+        const char *arg;
+
+        if (!got_magic) {
+            if (!strcmp(line, "FFRECOV1")) {
+                got_magic = 1;
+                continue;
+            }
+            return AVERROR_INVALIDDATA;
+        }
+
+        if (av_strstart(line, "progress_us=", &arg)) {
+            progress_us = strtoll(arg, NULL, 10);
+        } else if (av_strstart(line, "file_size=", &arg)) {
+            file_size = strtoll(arg, NULL, 10);
+        } else if (av_strstart(line, "IST ", &arg)) {
+            int file_idx = 0;
+            int stream_idx = 0;
+            int64_t pts_us = AV_NOPTS_VALUE;
+            unsigned long long frames = 0;
+
+            if (sscanf(line, "IST %d %d %"SCNd64" %"SCNu64,
+                       &file_idx, &stream_idx, &pts_us, &frames) == 4) {
+                if (file_idx >= 0 && file_idx < nb_input_files) {
+                    InputFile *f = input_files[file_idx];
+                    if (f && stream_idx >= 0 && stream_idx < f->nb_streams) {
+                        InputStream *ist = f->streams[stream_idx];
+                        if (ist)
+                            ist->recovery_target_pts_us = pts_us;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!got_magic)
+        return AVERROR_INVALIDDATA;
+    if (file_size < 0)
+        return AVERROR_INVALIDDATA;
+
+    *file_size_out   = file_size;
+    *progress_us_out = progress_us;
+
+    recovery_apply_seeks();
+
+    av_log(of, AV_LOG_INFO,
+           "Loaded recovery checkpoint: size=%"PRId64" progress=%"PRId64"us\n",
+           file_size, progress_us);
+
+    return 0;
+}
+
+static int recovery_try_resume(OutputFile *of, int *open_flags)
+{
+    char *content = NULL;
+    size_t content_size = 0;
+    int64_t file_size = -1;
+    int64_t progress_us = AV_NOPTS_VALUE;
+    int ret;
+
+    if (!of->recovery_path)
+        return 0;
+
+    if (access(of->recovery_path, F_OK) < 0)
+        return 0;
+
+    ret = recovery_load_file(of->recovery_path, &content, &content_size);
+    if (ret < 0)
+        return ret;
+
+    ret = recovery_parse_checkpoint(of, content, &file_size, &progress_us);
+    av_free(content);
+    if (ret < 0)
+        return ret;
+
+    of->recovery.append      = 1;
+    of->recovery.file_size   = file_size;
+    of->recovery.progress_us = progress_us;
+
+    recovery_state.active = recovery_state.active || recovery_enabled;
+    recovery_state.resume_attempted = 1;
+    if (!recovery_state.interval_us)
+        recovery_state.interval_us = recovery_interval;
+
+    *open_flags |= AVIO_FLAG_READ;
+
+    return 0;
+}
+
+static int recovery_write_snapshot(OutputFile *of, int64_t progress_us)
+{
+    AVBPrint bp;
+    char *data = NULL;
+    AVIOContext *pb = NULL;
+    int ret;
+
+    if (!of->recovery_path)
+        return 0;
+
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
+    av_bprintf(&bp, "FFRECOV1\n");
+    av_bprintf(&bp, "progress_us=%"PRId64"\n", progress_us);
+    av_bprintf(&bp, "file_size=%"PRId64"\n", of_filesize(of));
+
+    for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
+        uint64_t frames = 0;
+        int64_t last_pts = AV_NOPTS_VALUE;
+
+        if (ist->decoder) {
+            frames   = atomic_load(&ist->decoder->frames_decoded);
+            last_pts = atomic_load(&ist->decoder->last_pts_us);
+        }
+
+        av_bprintf(&bp, "IST %d %d %"PRId64" %"PRIu64"\n",
+                   ist->file->index, ist->index, last_pts, frames);
+    }
+
+    ret = av_bprint_finalize(&bp, &data);
+    if (ret < 0)
+        return ret;
+
+    ret = avio_open2(&pb, of->recovery_path, AVIO_FLAG_WRITE, &int_cb, NULL);
+    if (ret >= 0) {
+        avio_write(pb, (const unsigned char *)data, strlen(data));
+        avio_flush(pb);
+        avio_closep(&pb);
+    }
+
+    if (ret < 0)
+        av_log(of, AV_LOG_WARNING,
+               "Failed to write recovery checkpoint to %s: %s\n",
+               of->recovery_path, av_err2str(ret));
+
+    av_free(data);
+
+    return ret;
+}
+
+static void recovery_cleanup(int success)
+{
+    if (!recovery_state.active && !recovery_state.resume_attempted)
+        return;
+
+    for (int i = 0; i < nb_output_files; i++) {
+        OutputFile *of = output_files[i];
+
+        if (!of || !of->recovery_path)
+            continue;
+
+        if (success)
+            unlink(of->recovery_path);
+    }
+
+    recovery_state = (RecoveryState){ 0 };
+}
+
+int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flags)
+{
+    int ret;
+
+    if (!of || !filename || (!recovery_enabled && !recovery_resume_enabled))
+        return 0;
+
+    if (!recovery_path_supported(filename))
+        return 0;
+
+    if (!of->recovery_path) {
+        of->recovery_path = recovery_build_path(filename);
+        if (!of->recovery_path)
+            return AVERROR(ENOMEM);
+    }
+
+    if (recovery_resume_enabled) {
+        ret = recovery_try_resume(of, open_flags);
+        if (ret < 0) {
+            av_log(of, AV_LOG_WARNING,
+                   "Ignoring recovery data for output %s: %s\n",
+                   filename, av_err2str(ret));
+            // ignore errors, continue without resuming
+        }
+    }
+
+    if (recovery_enabled) {
+        of->recovery.enabled = 1;
+        recovery_state.active = 1;
+        recovery_state.interval_us = recovery_interval;
+    }
+
+    return 0;
+}
+
+void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
+                              int64_t progress_us)
+{
+    if (!recovery_state.active)
+        return;
+
+    if (!is_last_report) {
+        if (progress_us == AV_NOPTS_VALUE)
+            return;
+
+        if (recovery_state.interval_us > 0 &&
+            recovery_state.last_update_wallclock_us &&
+            wallclock_us - recovery_state.last_update_wallclock_us < recovery_state.interval_us)
+            return;
+    }
+
+    for (int i = 0; i < nb_output_files; i++) {
+        OutputFile *of = output_files[i];
+
+        if (!of || !of->recovery.enabled)
+            continue;
+
+        if (!is_last_report)
+            recovery_write_snapshot(of, progress_us);
+    }
+
+    if (!is_last_report)
+        recovery_state.last_update_wallclock_us = wallclock_us;
+}
+
 static void ffmpeg_cleanup(int ret)
 {
+    recovery_cleanup(ret >= 0);
+
     if ((print_graphs || print_graphs_file) && nb_output_files > 0)
         print_filtergraphs(filtergraphs, nb_filtergraphs, input_files, nb_input_files, output_files, nb_output_files);
 
@@ -686,6 +1041,8 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
 
     av_bprintf(&buf, " elapsed=%"PRId64":%02d:%02d.%02d", hours, mins, secs, ms / 10);
 
+    recovery_checkpoint_tick(is_last_report, cur_time, pts);
+
     if (print_stats || is_last_report) {
         const char end = is_last_report ? '\n' : '\r';
         if (print_stats==1 && AV_LOG_INFO > av_log_get_level()) {
@@ -802,6 +1159,46 @@ static void set_tty_echo(int on)
 #endif
 }
 
+static void toggle_transcoding_pause(const char *origin)
+{
+    Scheduler *sch = (Scheduler *)atomic_load(&transcoding_scheduler);
+
+    if (!sch) {
+        if (origin)
+            av_log(NULL, AV_LOG_WARNING,
+                   "\n\n%s pause request ignored: transcoder not ready yet.\n\n",
+                   origin);
+        return;
+    }
+
+    for (;;) {
+        int paused = atomic_load(&transcode_paused);
+        int ret = paused ? sch_resume(sch) : sch_pause(sch);
+
+        if (ret < 0) {
+            if (origin)
+                av_log(NULL, AV_LOG_ERROR,
+                       "\n\nUnable to %s transcoding: %s\n\n",
+                       paused ? "resume" : "pause", av_err2str(ret));
+            break;
+        }
+
+        if (atomic_compare_exchange_strong(&transcode_paused, &paused, !paused)) {
+            if (origin) {
+                if (!paused)
+                    av_log(NULL, AV_LOG_INFO,
+                           "\n\nTranscoding paused. Use %s again to resume.\n\n",
+                           origin);
+                else
+                    av_log(NULL, AV_LOG_INFO,
+                           "\n\nTranscoding resumed.\n\n");
+            }
+            break;
+        }
+        /* Another thread raced us; try again with the updated state. */
+    }
+}
+
 static int check_keyboard_interaction(int64_t cur_time)
 {
     int i, key;
@@ -816,6 +1213,8 @@ static int check_keyboard_interaction(int64_t cur_time)
         av_log(NULL, AV_LOG_INFO, "\n\n[q] command received. Exiting.\n\n");
         return AVERROR_EXIT;
     }
+    if (key == 'p')
+        toggle_transcoding_pause("[p]");
     if (key == '+') av_log_set_level(av_log_get_level()+10);
     if (key == '-') av_log_set_level(av_log_get_level()-10);
     if (key == 'c' || key == 'C'){
@@ -854,6 +1253,7 @@ static int check_keyboard_interaction(int64_t cur_time)
                         "?      show this help\n"
                         "+      increase verbosity\n"
                         "-      decrease verbosity\n"
+                        "p      toggle pause/resume\n"
                         "c      Send command to first matching filter supporting it\n"
                         "C      Send/Queue command to all matching filters\n"
                         "h      dump packets/hex press to cycle through the 3 states\n"
@@ -880,8 +1280,11 @@ static int transcode(Scheduler *sch)
     if (ret < 0)
         return ret;
 
+    atomic_store(&transcoding_scheduler, (uintptr_t)sch);
+    atomic_store(&transcode_paused, 0);
+
     if (stdin_interaction) {
-        av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
+        av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [p] to pause/resume, [?] for help\n");
     }
 
     timer_start = av_gettime_relative();
@@ -891,6 +1294,11 @@ static int transcode(Scheduler *sch)
 
         if (received_nb_signals)
             break;
+
+#ifdef SIGUSR2
+        if (atomic_exchange(&pause_toggle_pending, 0))
+            toggle_transcoding_pause("SIGUSR2");
+#endif
 
         /* if 'q' pressed, exits */
         if (stdin_interaction)
@@ -902,6 +1310,9 @@ static int transcode(Scheduler *sch)
     }
 
     ret = sch_stop(sch, &transcode_ts);
+
+    atomic_store(&transcoding_scheduler, (uintptr_t)NULL);
+    atomic_store(&transcode_paused, 0);
 
     /* write the trailer if needed */
     for (int i = 0; i < nb_output_files; i++) {
@@ -1035,3 +1446,10 @@ finish:
 
     return ret;
 }
+#ifdef SIGUSR2
+static void sigusr2_handler(int sig)
+{
+    (void)sig;
+    atomic_store(&pause_toggle_pending, 1);
+}
+#endif

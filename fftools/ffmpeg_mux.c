@@ -882,6 +882,8 @@ void of_free(OutputFile **pof)
 
     fc_close(&mux->fc);
 
+    av_freep(&of->recovery_path);
+
     av_freep(pof);
 }
 
