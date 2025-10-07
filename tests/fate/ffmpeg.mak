@@ -1,3 +1,11 @@
+FATE_FFMPEG-yes += fate-ffmpeg-pause
+fate-ffmpeg-pause: CMD = runlocal ffmpeg-interrupt.sh pause "$(TARGET_EXEC)" "$(TARGET_PATH)"
+fate-ffmpeg-pause: REF = $(SRC_PATH)/tests/ref/fate/ffmpeg-pause
+
+FATE_FFMPEG-yes += fate-ffmpeg-recovery
+fate-ffmpeg-recovery: CMD = runlocal ffmpeg-interrupt.sh recovery "$(TARGET_EXEC)" "$(TARGET_PATH)"
+fate-ffmpeg-recovery: REF = $(SRC_PATH)/tests/ref/fate/ffmpeg-recovery
+
 FATE_FFMPEG-$(call FILTERFRAMECRC, COLOR) += fate-ffmpeg-filter_complex
 fate-ffmpeg-filter_complex: CMD = framecrc -filter_complex color=d=1:r=5 -fflags +bitexact
 

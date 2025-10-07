@@ -123,6 +123,7 @@ typedef struct RecoveryState {
     int     resume_attempted;
     int64_t interval_us;
     int64_t last_update_wallclock_us;
+    int     preserve_checkpoints;
 } RecoveryState;
 
 static RecoveryState recovery_state = { 0 };
@@ -590,7 +591,7 @@ static void recovery_cleanup(int success)
         if (!of || !of->recovery_path)
             continue;
 
-        if (success)
+        if (success && !recovery_state.preserve_checkpoints)
             unlink(of->recovery_path);
     }
 
@@ -635,7 +636,17 @@ int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flag
 void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
                               int64_t progress_us)
 {
+    int should_flush;
+
     if (!recovery_state.active)
+        return;
+
+    should_flush = !is_last_report;
+
+    if (is_last_report && recovery_state.preserve_checkpoints)
+        should_flush = 1;
+
+    if (!should_flush)
         return;
 
     if (!is_last_report) {
@@ -648,14 +659,16 @@ void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
             return;
     }
 
+    if (progress_us == AV_NOPTS_VALUE)
+        return;
+
     for (int i = 0; i < nb_output_files; i++) {
         OutputFile *of = output_files[i];
 
         if (!of || !of->recovery.enabled)
             continue;
 
-        if (!is_last_report)
-            recovery_write_snapshot(of, progress_us);
+        recovery_write_snapshot(of, progress_us);
     }
 
     if (!is_last_report)
@@ -1273,6 +1286,7 @@ static int transcode(Scheduler *sch)
 {
     int ret = 0;
     int64_t timer_start, transcode_ts = 0;
+    int stop_requested = 0;
 
     print_stream_maps();
 
@@ -1295,7 +1309,7 @@ static int transcode(Scheduler *sch)
         int64_t cur_time= av_gettime_relative();
 
         if (received_nb_signals)
-            break;
+            { stop_requested = 1; break; }
 
 #ifdef SIGUSR2
         if (atomic_exchange(&pause_toggle_pending, 0))
@@ -1304,12 +1318,20 @@ static int transcode(Scheduler *sch)
 
         /* if 'q' pressed, exits */
         if (stdin_interaction)
-            if (check_keyboard_interaction(cur_time) < 0)
+            if (check_keyboard_interaction(cur_time) < 0) {
+                stop_requested = 1;
                 break;
+            }
 
         /* dump report by using the output first video and audio streams */
         print_report(0, timer_start, cur_time, transcode_ts);
     }
+
+    if (received_nb_signals)
+        stop_requested = 1;
+
+    if (stop_requested)
+        recovery_state.preserve_checkpoints = 1;
 
     ret = sch_stop(sch, &transcode_ts);
 
