@@ -1,2 +1,5 @@
-checkpoint=kept
+crash_checkpoint=ok
+frame_resume=ok
+probe=ok
 resume=ok
+checkpoint=clean

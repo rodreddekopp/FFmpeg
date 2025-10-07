@@ -79,7 +79,7 @@ static int check_opt_bitexact(void *ctx, const AVDictionary *opts,
     return 0;
 }
 
-static int truncate_output_tail(const char *filename, int64_t size)
+int ffmpeg_truncate_output_tail(const char *filename, int64_t size)
 {
     if (size < 0)
         return AVERROR(EINVAL);
@@ -3435,7 +3435,7 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
             int truncate_ret;
             int64_t seek_ret;
 
-            truncate_ret = truncate_output_tail(filename, of->recovery.file_size);
+            truncate_ret = ffmpeg_truncate_output_tail(filename, of->recovery.file_size);
             if (truncate_ret < 0 && truncate_ret != AVERROR(ENOSYS)) {
                 av_log(mux, AV_LOG_WARNING,
                        "Unable to truncate %s to %"PRId64" bytes: %s\n",

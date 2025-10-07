@@ -121,6 +121,7 @@ typedef struct Muxer {
     AVPacket               *sq_pkt;
 } Muxer;
 
+int ffmpeg_truncate_output_tail(const char *filename, int64_t size);
 int mux_check_init(void *arg);
 
 static inline MuxStream *ms_from_ost(OutputStream *ost)

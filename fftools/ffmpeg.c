@@ -123,10 +123,17 @@ typedef struct RecoveryState {
     int     resume_attempted;
     int64_t interval_us;
     int64_t last_update_wallclock_us;
+    int64_t last_progress_us;
     int     preserve_checkpoints;
 } RecoveryState;
 
-static RecoveryState recovery_state = { 0 };
+static const RecoveryState recovery_state_default = {
+    .last_progress_us = AV_NOPTS_VALUE,
+};
+
+static RecoveryState recovery_state = {
+    .last_progress_us = AV_NOPTS_VALUE,
+};
 
 #if HAVE_TERMIOS_H
 
@@ -160,6 +167,46 @@ static void sigusr2_handler(int sig);
 #endif
 static volatile int ffmpeg_exited = 0;
 static int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
+
+static int64_t pause_time_accum_us      = 0;
+static int64_t pause_time_last_start_us = 0;
+
+static void pause_state_reset(void)
+{
+    pause_time_accum_us      = 0;
+    pause_time_last_start_us = 0;
+}
+
+static void pause_state_begin(int64_t now)
+{
+    if (!pause_time_last_start_us)
+        pause_time_last_start_us = now;
+}
+
+static void pause_state_end(int64_t now)
+{
+    if (pause_time_last_start_us) {
+        if (now > pause_time_last_start_us)
+            pause_time_accum_us += now - pause_time_last_start_us;
+        pause_time_last_start_us = 0;
+    }
+}
+
+static double encoding_elapsed_seconds(int64_t timer_start, int64_t cur_time)
+{
+    int64_t total = pause_time_accum_us;
+
+    if (pause_time_last_start_us && cur_time > pause_time_last_start_us)
+        total += cur_time - pause_time_last_start_us;
+
+    if (cur_time <= timer_start)
+        return 0.0;
+
+    if (total > cur_time - timer_start)
+        total = cur_time - timer_start;
+
+    return (double)(cur_time - timer_start - total) / 1000000.0;
+}
 
 static void
 sigterm_handler(int sig)
@@ -474,6 +521,22 @@ static int recovery_parse_checkpoint(OutputFile *of, char *content,
                     }
                 }
             }
+        } else if (av_strstart(line, "OST ", &arg)) {
+            int file_idx = 0;
+            int stream_idx = 0;
+            uint64_t packets = 0;
+
+            if (sscanf(line, "OST %d %d %" SCNu64,
+                       &file_idx, &stream_idx, &packets) == 3) {
+                if (file_idx >= 0 && file_idx < nb_output_files) {
+                    OutputFile *of_it = output_files[file_idx];
+                    if (of_it && stream_idx >= 0 && stream_idx < of_it->nb_streams) {
+                        OutputStream *ost = of_it->streams[stream_idx];
+                        if (ost)
+                            atomic_store(&ost->packets_written, packets);
+                    }
+                }
+            }
         }
     }
 
@@ -521,6 +584,9 @@ static int recovery_try_resume(OutputFile *of, int *open_flags)
     of->recovery.file_size   = file_size;
     of->recovery.progress_us = progress_us;
 
+    if (progress_us != AV_NOPTS_VALUE)
+        recovery_state.last_progress_us = progress_us;
+
     recovery_state.active = recovery_state.active || recovery_enabled;
     recovery_state.resume_attempted = 1;
     if (!recovery_state.interval_us)
@@ -537,14 +603,19 @@ static int recovery_write_snapshot(OutputFile *of, int64_t progress_us)
     char *data = NULL;
     AVIOContext *pb = NULL;
     int ret;
+    int64_t file_size;
 
     if (!of->recovery_path)
         return 0;
 
+    file_size = of_filesize(of);
+    of->recovery.file_size   = file_size;
+    of->recovery.progress_us = progress_us;
+
     av_bprint_init(&bp, 0, AV_BPRINT_SIZE_AUTOMATIC);
     av_bprintf(&bp, "FFRECOV1\n");
     av_bprintf(&bp, "progress_us=%"PRId64"\n", progress_us);
-    av_bprintf(&bp, "file_size=%"PRId64"\n", of_filesize(of));
+    av_bprintf(&bp, "file_size=%"PRId64"\n", file_size);
 
     for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
         uint64_t frames = 0;
@@ -557,6 +628,13 @@ static int recovery_write_snapshot(OutputFile *of, int64_t progress_us)
 
         av_bprintf(&bp, "IST %d %d %"PRId64" %"PRIu64"\n",
                    ist->file->index, ist->index, last_pts, frames);
+    }
+
+    for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+        uint64_t packets = atomic_load(&ost->packets_written);
+
+        av_bprintf(&bp, "OST %d %d %"PRIu64"\n",
+                   ost->file->index, ost->index, packets);
     }
 
     ret = av_bprint_finalize(&bp, &data);
@@ -595,7 +673,7 @@ static void recovery_cleanup(int success)
             unlink(of->recovery_path);
     }
 
-    recovery_state = (RecoveryState){ 0 };
+    recovery_state = recovery_state_default;
 }
 
 int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flags)
@@ -628,6 +706,7 @@ int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flag
         of->recovery.enabled = 1;
         recovery_state.active = 1;
         recovery_state.interval_us = recovery_interval;
+        recovery_state.last_update_wallclock_us = 0;
     }
 
     return 0;
@@ -648,6 +727,9 @@ void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
 
     if (!should_flush)
         return;
+
+    if (progress_us == AV_NOPTS_VALUE)
+        progress_us = recovery_state.last_progress_us;
 
     if (!is_last_report) {
         if (progress_us == AV_NOPTS_VALUE)
@@ -671,8 +753,8 @@ void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
         recovery_write_snapshot(of, progress_us);
     }
 
-    if (!is_last_report)
-        recovery_state.last_update_wallclock_us = wallclock_us;
+    recovery_state.last_progress_us = progress_us;
+    recovery_state.last_update_wallclock_us = wallclock_us;
 }
 
 static void ffmpeg_cleanup(int ret)
@@ -936,7 +1018,9 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     int64_t hours;
     const char *hours_sign;
     int ret;
-    float t;
+    double elapsed;
+
+    recovery_checkpoint_tick(is_last_report, cur_time, pts);
 
     if (!print_stats && !is_last_report && !progress_avio)
         return;
@@ -951,7 +1035,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         last_time = cur_time;
     }
 
-    t = (cur_time-timer_start) / 1000000.0;
+    elapsed = encoding_elapsed_seconds(timer_start, cur_time);
 
     vid = 0;
     av_bprint_init(&buf, 0, AV_BPRINT_SIZE_AUTOMATIC);
@@ -966,10 +1050,10 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
                        ost->file->index, ost->index, q);
         }
         if (!vid && ost->type == AVMEDIA_TYPE_VIDEO) {
-            float fps;
+            double fps;
             uint64_t frame_number = atomic_load(&ost->packets_written);
 
-            fps = t > 1 ? frame_number / t : 0;
+            fps = elapsed > 1.0 ? frame_number / elapsed : 0.0;
             av_bprintf(&buf, "frame=%5"PRId64" fps=%3.*f q=%3.1f ",
                      frame_number, fps < 9.95, fps, q);
             av_bprintf(&buf_script, "frame=%"PRId64"\n", frame_number);
@@ -1002,7 +1086,7 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     hours_sign = (pts < 0) ? "-" : "";
 
     bitrate = pts != AV_NOPTS_VALUE && pts && total_size >= 0 ? total_size * 8 / (pts / 1000.0) : -1;
-    speed   = pts != AV_NOPTS_VALUE && t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
+    speed   = pts != AV_NOPTS_VALUE && elapsed > 0.0 ? (double)pts / AV_TIME_BASE / elapsed : -1;
 
     if (total_size < 0) av_bprintf(&buf, "size=N/A time=");
     else                av_bprintf(&buf, "size=%8.0fKiB time=", total_size / 1024.0);
@@ -1047,16 +1131,30 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
         av_bprintf(&buf_script, "speed=%4.3gx\n", speed);
     }
 
-    secs = (int)t;
-    ms = (int)((t - secs) * 1000);
-    mins = secs / 60;
-    secs %= 60;
-    hours = mins / 60;
-    mins %= 60;
+    {
+        int64_t total_secs;
+        double fractional;
+
+        if (elapsed < 0.0)
+            elapsed = 0.0;
+
+        total_secs = (int64_t)elapsed;
+        fractional = elapsed - total_secs;
+        if (fractional < 0.0)
+            fractional = 0.0;
+
+        ms = (int)(fractional * 1000.0);
+        if (ms < 0)
+            ms = 0;
+        else if (ms > 999)
+            ms = 999;
+
+        secs = (int)(total_secs % 60);
+        mins = (int)((total_secs / 60) % 60);
+        hours = total_secs / 3600;
+    }
 
     av_bprintf(&buf, " elapsed=%"PRId64":%02d:%02d.%02d", hours, mins, secs, ms / 10);
-
-    recovery_checkpoint_tick(is_last_report, cur_time, pts);
 
     if (print_stats || is_last_report) {
         const char end = is_last_report ? '\n' : '\r';
@@ -1199,6 +1297,11 @@ static void toggle_transcoding_pause(const char *origin)
         }
 
         if (atomic_compare_exchange_strong(&transcode_paused, &paused, !paused)) {
+            int64_t now = av_gettime_relative();
+            if (!paused)
+                pause_state_begin(now);
+            else
+                pause_state_end(now);
             if (origin) {
                 if (!paused)
                     av_log(NULL, AV_LOG_INFO,
@@ -1298,6 +1401,7 @@ static int transcode(Scheduler *sch)
 
     atomic_store(&transcoding_scheduler, (uintptr_t)sch);
     atomic_store(&transcode_paused, 0);
+    pause_state_reset();
 
     if (stdin_interaction) {
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [p] to pause/resume, [?] for help\n");

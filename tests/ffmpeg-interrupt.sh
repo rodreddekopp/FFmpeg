@@ -146,40 +146,101 @@ case "$mode" in
     recovery)
         output="$outdir/ffmpeg-recovery.nut"
         sidecar="${output}.ffrecovery"
-        rm -f "$output" "$sidecar"
+        crash_log="$outdir/ffmpeg-recovery-crash.log"
+        resume_log="$outdir/ffmpeg-recovery-resume.log"
+        finish_log="$outdir/ffmpeg-recovery-finish.log"
+        rm -f "$output" "$sidecar" "$crash_log" "$resume_log" "$finish_log"
 
         "$ffmpeg_exec" -hide_banner -loglevel info -nostdin -stats_period 0.1 \
-            -auto_recovery -recovery_interval 0 \
-            -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 900 \
+            -auto_recovery -recovery_interval 0.2 \
+            -re -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 90 \
             -c:v mpeg2video -g 15 -f nut -y "$output" \
-            >"$outdir/ffmpeg-recovery-initial.log" 2>&1 &
+            >"$crash_log" 2>&1 &
         pid=$!
         trap 'cleanup_child "$pid"' INT TERM EXIT
 
-        sleep 0.2
-        kill -INT "$pid" 2>/dev/null || true
+        sleep 0.6
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
         wait "$pid" 2>/dev/null || true
         trap - INT TERM EXIT
 
         if [ ! -f "$sidecar" ]; then
-            echo "checkpoint=missing"
+            echo "crash_checkpoint=missing"
             exit 1
         fi
-        initial_size=$(get_size "$output")
+
+        crash_size=$(get_size "$output")
+        if [ "$crash_size" -le 0 ]; then
+            echo "crash_checkpoint=empty"
+            exit 1
+        fi
+
+        crash_frame=$(awk '/^OST /{print $4}' "$sidecar" | sort -n | tail -n1)
+        if [ -z "$crash_frame" ] || [ "$crash_frame" -le 0 ]; then
+            echo "crash_checkpoint=empty"
+            exit 1
+        fi
 
         "$ffmpeg_exec" -hide_banner -loglevel info -nostdin -stats_period 0.1 \
-            -auto_recovery -recovery_interval 0 \
-            -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 900 \
+            -auto_recovery -recovery_interval 0.2 \
+            -re -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 90 \
             -c:v mpeg2video -g 15 -f nut -y "$output" \
-            >"$outdir/ffmpeg-recovery-resume.log" 2>&1
+            >"$resume_log" 2>&1 &
+        pid=$!
+        trap 'cleanup_child "$pid"' INT TERM EXIT
 
-        if ! grep -q 'Loaded recovery checkpoint' "$outdir/ffmpeg-recovery-resume.log"; then
+        sleep 0.5
+        kill -INT "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        trap - INT TERM EXIT
+
+        if ! grep -q 'Loaded recovery checkpoint' "$resume_log"; then
+            echo "resume=no-checkpoint"
+            exit 1
+        fi
+
+        first_frame_line=$(grep -m1 'frame=' "$resume_log" || true)
+        if [ -z "$first_frame_line" ]; then
+            echo "frame_resume=no"
+            exit 1
+        fi
+        first_resume_frame=$(printf '%s' "$first_frame_line" | sed -E 's/.*frame= *([0-9]+).*/\1/')
+        if [ -z "$first_resume_frame" ] || [ "$first_resume_frame" -lt "$crash_frame" ]; then
+            echo "frame_resume=no"
+            exit 1
+        fi
+
+        if [ ! -f "$sidecar" ]; then
+            echo "checkpoint=lost"
+            exit 1
+        fi
+
+        resume_size=$(get_size "$output")
+        if [ "$resume_size" -le "$crash_size" ]; then
+            echo "resume=no-growth"
+            exit 1
+        fi
+
+        if ! "$ffprobe_exec" -v error -show_streams "$output" >/dev/null 2>&1; then
+            echo "probe=fail"
+            exit 1
+        fi
+
+        "$ffmpeg_exec" -hide_banner -loglevel info -nostdin -stats_period 0.1 \
+            -auto_recovery -recovery_interval 0.2 \
+            -re -f lavfi -i testsrc=size=640x360:rate=30 -frames:v 90 \
+            -c:v mpeg2video -g 15 -f nut -y "$output" \
+            >"$finish_log" 2>&1
+
+        if ! grep -q 'Loaded recovery checkpoint' "$finish_log"; then
             echo "resume=no-checkpoint"
             exit 1
         fi
 
         final_size=$(get_size "$output")
-        if [ "$final_size" -le "$initial_size" ]; then
+        if [ "$final_size" -le "$resume_size" ]; then
             echo "resume=no-growth"
             exit 1
         fi
@@ -189,9 +250,11 @@ case "$mode" in
             exit 1
         fi
 
-
-        echo "checkpoint=kept"
+        echo "crash_checkpoint=ok"
+        echo "frame_resume=ok"
+        echo "probe=ok"
         echo "resume=ok"
+        echo "checkpoint=clean"
         ;;
     *)
         echo "unknown mode" >&2

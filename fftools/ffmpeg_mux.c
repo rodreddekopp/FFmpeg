@@ -568,6 +568,31 @@ int mux_check_init(void *arg)
     //assert_avoptions(of->opts);
     mux->header_written = 1;
 
+    if (of->recovery.append && fc->pb && !(fc->oformat->flags & AVFMT_NOFILE)) {
+        int64_t target = of->recovery.file_size;
+        int trunc_ret;
+        int64_t seek_ret;
+
+        avio_flush(fc->pb);
+        seek_ret = avio_seek(fc->pb, target, SEEK_SET);
+        if (seek_ret < 0) {
+            av_log(mux, AV_LOG_ERROR,
+                   "Seeking to recovery offset failed for %s: %s\n",
+                   fc->url, av_err2str((int)seek_ret));
+            return (int)seek_ret;
+        }
+
+        trunc_ret = avio_truncate(fc->pb, target);
+        if (trunc_ret == AVERROR(ENOSYS) && fc->url && fc->url[0])
+            trunc_ret = ffmpeg_truncate_output_tail(fc->url, target);
+
+        if (trunc_ret < 0 && trunc_ret != AVERROR(ENOSYS)) {
+            av_log(mux, AV_LOG_WARNING,
+                   "Unable to truncate %s to %"PRId64" bytes after header rewrite: %s\n",
+                   fc->url, target, av_err2str(trunc_ret));
+        }
+    }
+
     av_dump_format(fc, of->index, fc->url, 1);
     atomic_fetch_add(&nb_output_dumped, 1);
 
