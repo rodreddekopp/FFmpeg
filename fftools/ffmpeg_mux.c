@@ -27,6 +27,7 @@
 
 #include "libavutil/avstring.h"
 #include "libavutil/base64.h"
+#include "libavutil/error.h"
 #include "libavutil/fifo.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
@@ -294,6 +295,37 @@ fail:
     av_freep(&payload);
     av_freep(&encoded);
     return ret;
+}
+
+static int mov_checkpoint_publish(OutputFile *of, int64_t append_pos)
+{
+    Muxer *mux = mux_from_of(of);
+    AVFormatContext *fc = mux ? mux->fc : NULL;
+    int ret;
+    int64_t seek_ret;
+
+    if (!fc || !fc->pb || (fc->oformat->flags & AVFMT_NOFILE))
+        return 0;
+
+    ret = ff_mov_checkpoint_trailer(fc);
+    if (ret < 0) {
+        av_log(of, AV_LOG_WARNING,
+               "Failed to finalize MOV recovery checkpoint for %s: %s\n",
+               fc->url ? fc->url : "output", av_err2str(ret));
+        return ret;
+    }
+
+    avio_flush(fc->pb);
+
+    seek_ret = avio_seek(fc->pb, append_pos, SEEK_SET);
+    if (seek_ret < 0) {
+        av_log(of, AV_LOG_WARNING,
+               "Failed to restore MOV write position for %s: %s\n",
+               fc->url ? fc->url : "output", av_err2str((int)seek_ret));
+        return (int)seek_ret;
+    }
+
+    return 0;
 }
 
 static int mov_recovery_read_entry(MovCheckpointEntry *entry,
@@ -634,6 +666,22 @@ int ffmpeg_mux_checkpoint_flush(OutputFile *of)
 
     avio_flush(fc->pb);
     atomic_store(&mux->last_filesize, filesize(fc->pb));
+
+    return 0;
+}
+
+int ffmpeg_mux_checkpoint_publish(OutputFile *of, int64_t append_pos)
+{
+    Muxer *mux = mux_from_of(of);
+    AVFormatContext *fc = mux ? mux->fc : NULL;
+
+    if (!mux || !fc || append_pos < 0)
+        return 0;
+
+#if ENABLE_MOV_RECOVERY
+    if (mov_recovery_supported(fc))
+        return mov_checkpoint_publish(of, append_pos);
+#endif
 
     return 0;
 }

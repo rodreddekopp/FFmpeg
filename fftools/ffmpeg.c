@@ -704,6 +704,15 @@ static int recovery_write_snapshot(OutputFile *of, int64_t progress_us,
         avio_closep(&pb);
     }
 
+    if (ret >= 0) {
+        int publish_ret = ffmpeg_mux_checkpoint_publish(of, file_size);
+        if (publish_ret < 0)
+            av_log(of, AV_LOG_WARNING,
+                   "Failed to publish recovery checkpoint for %s: %s\n",
+                   of->url ? of->url : "output",
+                   av_err2str(publish_ret));
+    }
+
 out:
     if (ret < 0)
         av_log(of, AV_LOG_WARNING,

@@ -123,6 +123,7 @@ typedef struct Muxer {
 
 int ffmpeg_truncate_output_tail(const char *filename, int64_t size);
 int ffmpeg_mux_checkpoint_flush(OutputFile *of);
+int ffmpeg_mux_checkpoint_publish(OutputFile *of, int64_t append_pos);
 int ffmpeg_mux_recovery_parse(OutputFile *of, const char *line);
 int ffmpeg_mux_recovery_serialize(OutputFile *of, AVBPrint *bp);
 int ffmpeg_mux_recovery_apply(OutputFile *of);

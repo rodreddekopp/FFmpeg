@@ -8693,6 +8693,93 @@ static int mov_check_bitstream(AVFormatContext *s, AVStream *st,
     return ret;
 }
 
+int ff_mov_checkpoint_trailer(AVFormatContext *s)
+{
+    MOVMuxContext *mov = s->priv_data;
+    MOVMuxContext *snapshot = NULL;
+    MOVTrack *tracks = NULL;
+    int ret = 0;
+
+    if (!mov)
+        return AVERROR(EINVAL);
+
+    snapshot = av_memdup(mov, sizeof(*snapshot));
+    if (!snapshot)
+        return AVERROR(ENOMEM);
+
+    snapshot->tracks   = NULL;
+    snapshot->mdat_buf = NULL;
+    snapshot->pkt      = NULL;
+
+    if (mov->nb_tracks > 0) {
+        tracks = av_calloc(mov->nb_tracks, sizeof(*tracks));
+        if (!tracks) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        snapshot->tracks = tracks;
+
+        for (int i = 0; i < mov->nb_tracks; i++) {
+            MOVTrack *src = &mov->tracks[i];
+            MOVTrack *dst = &snapshot->tracks[i];
+
+            *dst = *src;
+
+            dst->cluster         = NULL;
+            dst->cluster_written = NULL;
+            dst->frag_info       = NULL;
+            dst->mdat_buf        = NULL;
+
+            if (src->entry > 0 && src->cluster) {
+                dst->cluster = av_memdup(src->cluster,
+                                         src->entry * sizeof(*src->cluster));
+                if (!dst->cluster) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+            }
+
+            if (src->entry_written > 0 && src->cluster_written) {
+                dst->cluster_written = av_memdup(src->cluster_written,
+                                                 src->entry_written * sizeof(*src->cluster_written));
+                if (!dst->cluster_written) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+            }
+
+            if (src->nb_frag_info > 0 && src->frag_info) {
+                dst->frag_info = av_memdup(src->frag_info,
+                                           src->nb_frag_info * sizeof(*src->frag_info));
+                if (!dst->frag_info) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+            }
+        }
+    }
+
+    s->priv_data = snapshot;
+    ret = mov_write_trailer(s);
+    s->priv_data = mov;
+
+fail:
+    if (snapshot) {
+        if (snapshot->tracks) {
+            for (int i = 0; i < mov->nb_tracks; i++) {
+                av_free(snapshot->tracks[i].cluster);
+                av_free(snapshot->tracks[i].cluster_written);
+                av_free(snapshot->tracks[i].frag_info);
+            }
+            av_free(snapshot->tracks);
+        }
+        av_free(snapshot);
+    }
+
+    return ret;
+}
+
 #if CONFIG_AVIF_MUXER
 static int avif_write_trailer(AVFormatContext *s)
 {
