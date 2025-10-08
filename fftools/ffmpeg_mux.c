@@ -79,6 +79,20 @@ static int64_t filesize(AVIOContext *pb)
     return ret;
 }
 
+static int64_t appendpos(AVIOContext *pb)
+{
+    int64_t ret;
+
+    if (!pb)
+        return -1;
+
+    ret = avio_tell(pb);
+    if (ret >= 0)
+        return ret;
+
+    return filesize(pb);
+}
+
 #if ENABLE_MOV_RECOVERY
 
 #define MOV_RECOVERY_VERSION 1
@@ -665,7 +679,7 @@ int ffmpeg_mux_checkpoint_flush(OutputFile *of)
         return 0;
 
     avio_flush(fc->pb);
-    atomic_store(&mux->last_filesize, filesize(fc->pb));
+    atomic_store(&mux->last_filesize, appendpos(fc->pb));
 
     return 0;
 }
@@ -839,7 +853,7 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
     uint64_t frame_num;
     int ret;
 
-    fs = filesize(s->pb);
+    fs = appendpos(s->pb);
     atomic_store(&mux->last_filesize, fs);
     if (fs >= mux->limit_filesize) {
         ret = AVERROR_EOF;
@@ -865,6 +879,8 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
                av_err2str(ret));
         goto fail;
     }
+
+    atomic_store(&mux->last_filesize, appendpos(s->pb));
 
     return 0;
 fail:
