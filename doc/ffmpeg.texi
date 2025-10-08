@@ -1436,6 +1436,12 @@ regular outputs. The file records the last confirmed output size along with
 per-stream decoding progress so that long running encodes can be resumed after
 an unexpected interruption. This option is disabled by default.
 
+Container formats that require accumulated indexing state in order to be
+playable, such as @command{mov}/@command{mp4} and the related Smooth Streaming
+profiles, are currently excluded from recovery tracking. When recovery is
+requested for one of these muxers ffmpeg logs a warning and continues without
+creating checkpoints so previously generated fragments remain valid.
+
 While recovery tracking is active the interactive status line gains an extra
 @code{chkpt=} field, and progress logs emitted through @option{-progress} gain a
 matching @code{checkpoint_frame} entry. Both values report the video frame

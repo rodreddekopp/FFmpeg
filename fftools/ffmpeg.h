@@ -829,7 +829,8 @@ void fg_send_command(FilterGraph *fg, double time, const char *target,
 
 int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch);
 
-int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flags);
+int recovery_prepare_output(OutputFile *of, AVFormatContext *oc,
+                            const char *filename, int *open_flags);
 void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
                               int64_t progress_us, int64_t elapsed_us);
 

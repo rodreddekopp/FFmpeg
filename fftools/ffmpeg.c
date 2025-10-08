@@ -133,6 +133,11 @@ typedef struct RecoveryState {
     uint64_t last_checkpoint_frame;
 } RecoveryState;
 
+static const char *const recovery_format_blocklist[] = {
+    "mp4", "mov", "m4a", "3gp", "3g2", "mj2", "ism", "ismv",
+    NULL,
+};
+
 static const RecoveryState recovery_state_default = {
     .last_progress_us = AV_NOPTS_VALUE,
 };
@@ -383,6 +388,19 @@ static int decode_interrupt_cb(void *ctx)
 }
 
 const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
+
+static int recovery_format_supported(const AVOutputFormat *fmt)
+{
+    if (!fmt)
+        return 1;
+
+    for (const char *const *name = recovery_format_blocklist; *name; name++) {
+        if (av_match_name(*name, fmt->name))
+            return 0;
+    }
+
+    return 1;
+}
 
 static int recovery_path_supported(const char *url)
 {
@@ -718,15 +736,35 @@ static void recovery_cleanup(int success)
     encoding_time_offset_us = 0;
 }
 
-int recovery_prepare_output(OutputFile *of, const char *filename, int *open_flags)
+int recovery_prepare_output(OutputFile *of, AVFormatContext *oc,
+                            const char *filename, int *open_flags)
 {
     int ret;
+    int format_recovery_supported = recovery_format_supported(oc ? oc->oformat : NULL);
 
     if (!of || !filename || (!recovery_enabled && !recovery_resume_enabled))
         return 0;
 
     if (!recovery_path_supported(filename))
         return 0;
+
+    if (!format_recovery_supported) {
+        if (recovery_resume_enabled)
+            av_log(of, AV_LOG_WARNING,
+                   "Automatic recovery resume is not supported for '%s' outputs; "
+                   "ignoring %s recovery data.\n",
+                   oc && oc->oformat ? oc->oformat->name : filename,
+                   filename);
+
+        if (recovery_enabled)
+            av_log(of, AV_LOG_WARNING,
+                   "Periodic recovery checkpoints are not available for '%s' outputs; "
+                   "continuing without recovery for %s.\n",
+                   oc && oc->oformat ? oc->oformat->name : filename,
+                   filename);
+
+        return 0;
+    }
 
     if (!of->recovery_path) {
         of->recovery_path = recovery_build_path(filename);

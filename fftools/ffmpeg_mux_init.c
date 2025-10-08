@@ -3411,7 +3411,7 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
 
     int open_flags = AVIO_FLAG_WRITE;
 
-    err = recovery_prepare_output(of, filename, &open_flags);
+    err = recovery_prepare_output(of, oc, filename, &open_flags);
     if (err < 0)
         return err;
 
