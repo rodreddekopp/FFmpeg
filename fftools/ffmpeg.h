@@ -609,6 +609,8 @@ enum CroppingType {
     CROP_CONTAINER,
 };
 
+struct MovRecoveryIndex;
+
 typedef struct OutputStream {
     const AVClass *class;
 
@@ -663,6 +665,10 @@ typedef struct OutputStream {
      * subtitles utilizing fix_sub_duration at random access points.
      */
     unsigned int fix_sub_duration_heartbeat;
+
+    struct {
+        struct MovRecoveryIndex *mov;
+    } recovery;
 } OutputStream;
 
 typedef struct OutputFile {
@@ -688,6 +694,8 @@ typedef struct OutputFile {
         int64_t progress_us;
         int64_t elapsed_us;
         uint64_t last_frame;
+        uint64_t mov_mdat_size;
+        int      have_mov_mdat_size;
     } recovery;
 } OutputFile;
 

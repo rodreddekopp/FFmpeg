@@ -26,6 +26,7 @@
 #include "sync_queue.h"
 
 #include "libavutil/avstring.h"
+#include "libavutil/base64.h"
 #include "libavutil/fifo.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/log.h"
@@ -37,6 +38,11 @@
 
 #include "libavformat/avformat.h"
 #include "libavformat/avio.h"
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#include "libavformat/movenc.h"
+#endif
 
 typedef struct MuxThreadContext {
     AVPacket *pkt;
@@ -59,6 +65,558 @@ static int64_t filesize(AVIOContext *pb)
     }
 
     return ret;
+}
+
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+
+#define MOV_RECOVERY_VERSION 1
+
+typedef struct MovCheckpointEntry {
+    uint64_t pos;
+    int64_t  dts;
+    int64_t  pts;
+    uint32_t size;
+    uint32_t stsd_index;
+    uint32_t samples_in_chunk;
+    uint32_t chunk_num;
+    uint32_t entries;
+    int32_t  cts;
+    uint32_t flags;
+    int64_t  prft_wallclock;
+    int32_t  prft_flags;
+} MovCheckpointEntry;
+
+struct MovRecoveryIndex {
+    unsigned version;
+    int      stream_index;
+
+    uint32_t mode;
+    uint32_t flags;
+    uint32_t timecode_flags;
+    int      has_keyframes;
+    int      has_disposable;
+    int      last_sample_is_subtitle_end;
+    int      end_reliable;
+    int      frag_discont;
+
+    uint32_t default_sample_flags;
+    uint32_t default_size;
+
+    unsigned timescale;
+
+    uint64_t entry;
+    uint64_t entry_written;
+    uint64_t entries_flushed;
+    uint64_t sample_count;
+    uint64_t sample_size;
+    uint64_t chunk_count;
+    int64_t  time;
+    int64_t  track_duration;
+    int64_t  start_dts;
+    int64_t  start_cts;
+    int64_t  end_pts;
+    int64_t  dts_shift;
+    int64_t  default_duration;
+    int64_t  data_offset;
+
+    unsigned nb_written;
+    unsigned nb_pending;
+    MovCheckpointEntry *written;
+    MovCheckpointEntry *pending;
+};
+
+static void mov_recovery_index_free(struct MovRecoveryIndex **pidx)
+{
+    struct MovRecoveryIndex *idx = pidx ? *pidx : NULL;
+
+    if (!idx)
+        return;
+
+    av_freep(&idx->written);
+    av_freep(&idx->pending);
+    av_freep(pidx);
+}
+
+static void mov_recovery_write_entry(AVIOContext *pb, const MOVIentry *entry)
+{
+    avio_wb64(pb, entry->pos);
+    avio_wb64(pb, entry->dts);
+    avio_wb64(pb, entry->pts);
+    avio_wb32(pb, entry->size);
+    avio_wb32(pb, entry->stsd_index);
+    avio_wb32(pb, entry->samples_in_chunk);
+    avio_wb32(pb, entry->chunkNum);
+    avio_wb32(pb, entry->entries);
+    avio_wb32(pb, entry->cts);
+    avio_wb32(pb, entry->flags);
+    avio_wb64(pb, entry->prft.wallclock);
+    avio_wb32(pb, entry->prft.flags);
+}
+
+static void mov_recovery_fill_entry(MOVIentry *dst,
+                                    const MovCheckpointEntry *src)
+{
+    dst->pos              = src->pos;
+    dst->dts              = src->dts;
+    dst->pts              = src->pts;
+    dst->size             = src->size;
+    dst->stsd_index       = src->stsd_index;
+    dst->samples_in_chunk = src->samples_in_chunk;
+    dst->chunkNum         = src->chunk_num;
+    dst->entries          = src->entries;
+    dst->cts              = src->cts;
+    dst->flags            = src->flags;
+    dst->prft.wallclock   = src->prft_wallclock;
+    dst->prft.flags       = src->prft_flags;
+}
+
+static int mov_recovery_supported(const AVFormatContext *fc)
+{
+    if (!fc || !fc->oformat)
+        return 0;
+
+    return av_match_name(fc->oformat->name,
+                         "mov,mp4,m4a,3gp,3g2,mj2,ism,ismv");
+}
+
+static int mov_recovery_collect_track(AVIOContext *pb, const MOVTrack *track,
+                                      int stream_index)
+{
+    avio_wb32(pb, MOV_RECOVERY_VERSION);
+    avio_wb32(pb, stream_index);
+
+    avio_wb32(pb, track->mode);
+    avio_wb32(pb, track->flags);
+    avio_wb32(pb, track->timecode_flags);
+    avio_wb32(pb, track->has_keyframes);
+    avio_wb32(pb, track->has_disposable);
+    avio_wb32(pb, track->last_sample_is_subtitle_end);
+    avio_wb32(pb, track->end_reliable);
+    avio_wb32(pb, track->frag_discont);
+
+    avio_wb32(pb, track->default_sample_flags);
+    avio_wb32(pb, track->default_size);
+
+    avio_wb32(pb, track->timescale);
+
+    avio_wb64(pb, track->entry);
+    avio_wb64(pb, track->entry_written);
+    avio_wb64(pb, track->entries_flushed);
+    avio_wb64(pb, track->sample_count);
+    avio_wb64(pb, track->sample_size);
+    avio_wb64(pb, track->chunkCount);
+    avio_wb64(pb, track->time);
+    avio_wb64(pb, track->track_duration);
+    avio_wb64(pb, track->start_dts);
+    avio_wb64(pb, track->start_cts);
+    avio_wb64(pb, track->end_pts);
+    avio_wb64(pb, track->dts_shift);
+    avio_wb64(pb, track->default_duration);
+    avio_wb64(pb, track->data_offset);
+
+    avio_wb32(pb, track->entry_written);
+    for (uint64_t i = 0; i < track->entry_written; i++)
+        mov_recovery_write_entry(pb, &track->cluster_written[i]);
+
+    avio_wb32(pb, track->entry);
+    for (uint64_t i = 0; i < track->entry; i++)
+        mov_recovery_write_entry(pb, &track->cluster[i]);
+
+    return 0;
+}
+
+static int mov_recovery_collect(OutputFile *of, AVBPrint *bp)
+{
+    Muxer *mux = mux_from_of(of);
+    AVFormatContext *fc = mux ? mux->fc : NULL;
+    MOVMuxContext *mov;
+    AVIOContext *dyn = NULL;
+    uint8_t *payload = NULL;
+    char *encoded = NULL;
+    int size;
+    int ret;
+
+    if (!fc || !mov_recovery_supported(fc))
+        return 0;
+
+    mov = fc->priv_data;
+    if (!mov)
+        return 0;
+
+    av_bprintf(bp, "MOVF %d %"PRIu64"\n", MOV_RECOVERY_VERSION, mov->mdat_size);
+
+    for (int i = 0; i < mov->nb_streams && i < of->nb_streams; i++) {
+        MOVTrack *track = &mov->tracks[i];
+
+        ret = avio_open_dyn_buf(&dyn);
+        if (ret < 0)
+            goto fail;
+
+        ret = mov_recovery_collect_track(dyn, track, i);
+        if (ret < 0)
+            goto fail;
+
+        size = avio_close_dyn_buf(dyn, &payload);
+        dyn = NULL;
+        if (size < 0) {
+            ret = size;
+            goto fail;
+        }
+
+        encoded = av_malloc(AV_BASE64_SIZE(size));
+        if (!encoded) {
+            ret = AVERROR(ENOMEM);
+            goto fail;
+        }
+
+        av_base64_encode(encoded, AV_BASE64_SIZE(size), payload, size);
+        av_bprintf(bp, "MOVT %d %s\n", i, encoded);
+
+        av_freep(&payload);
+        av_freep(&encoded);
+    }
+
+    ret = 0;
+fail:
+    if (dyn)
+        avio_close_dyn_buf(dyn, &payload);
+    av_freep(&payload);
+    av_freep(&encoded);
+    return ret;
+}
+
+static int mov_recovery_read_entry(MovCheckpointEntry *entry,
+                                   const uint8_t **pp, const uint8_t *end)
+{
+    const uint8_t *p = *pp;
+
+    if (end - p < 8 * 3 + 4 * 7 + 8 + 4)
+        return AVERROR_INVALIDDATA;
+
+    entry->pos              = AV_RB64(p); p += 8;
+    entry->dts              = AV_RB64(p); p += 8;
+    entry->pts              = AV_RB64(p); p += 8;
+    entry->size             = AV_RB32(p); p += 4;
+    entry->stsd_index       = AV_RB32(p); p += 4;
+    entry->samples_in_chunk = AV_RB32(p); p += 4;
+    entry->chunk_num        = AV_RB32(p); p += 4;
+    entry->entries          = AV_RB32(p); p += 4;
+    entry->cts              = AV_RB32(p); p += 4;
+    entry->flags            = AV_RB32(p); p += 4;
+    entry->prft_wallclock   = AV_RB64(p); p += 8;
+    entry->prft_flags       = AV_RB32(p); p += 4;
+
+    *pp = p;
+    return 0;
+}
+
+static int mov_recovery_parse_track(OutputFile *of, int stream_index,
+                                     const uint8_t *data, const uint8_t *end)
+{
+    struct MovRecoveryIndex *idx = NULL;
+    OutputStream *ost;
+    int ret;
+    uint32_t version;
+
+    if (stream_index < 0 || stream_index >= of->nb_streams)
+        return AVERROR_INVALIDDATA;
+
+    ost = of->streams[stream_index];
+    if (!ost)
+        return AVERROR_INVALIDDATA;
+
+    if (end - data < 4)
+        return AVERROR_INVALIDDATA;
+
+    version = AV_RB32(data); data += 4;
+    if (version != MOV_RECOVERY_VERSION)
+        return AVERROR_INVALIDDATA;
+
+    if (end - data < 4)
+        return AVERROR_INVALIDDATA;
+
+    if ((int)AV_RB32(data) != stream_index)
+        return AVERROR_INVALIDDATA;
+    data += 4;
+
+    idx = av_mallocz(sizeof(*idx));
+    if (!idx)
+        return AVERROR(ENOMEM);
+
+    idx->version = version;
+    idx->stream_index = stream_index;
+
+#define READ32(field) do { \
+        if (end - data < 4) { ret = AVERROR_INVALIDDATA; goto fail; } \
+        field = AV_RB32(data); \
+        data += 4; \
+    } while (0)
+#define READ64(field) do { \
+        if (end - data < 8) { ret = AVERROR_INVALIDDATA; goto fail; } \
+        field = AV_RB64(data); \
+        data += 8; \
+    } while (0)
+
+    READ32(idx->mode);
+    READ32(idx->flags);
+    READ32(idx->timecode_flags);
+    READ32(idx->has_keyframes);
+    READ32(idx->has_disposable);
+    READ32(idx->last_sample_is_subtitle_end);
+    READ32(idx->end_reliable);
+    READ32(idx->frag_discont);
+
+    READ32(idx->default_sample_flags);
+    READ32(idx->default_size);
+
+    READ32(idx->timescale);
+
+    READ64(idx->entry);
+    READ64(idx->entry_written);
+    READ64(idx->entries_flushed);
+    READ64(idx->sample_count);
+    READ64(idx->sample_size);
+    READ64(idx->chunk_count);
+    READ64(idx->time);
+    READ64(idx->track_duration);
+    READ64(idx->start_dts);
+    READ64(idx->start_cts);
+    READ64(idx->end_pts);
+    READ64(idx->dts_shift);
+    READ64(idx->default_duration);
+    READ64(idx->data_offset);
+
+    READ32(idx->nb_written);
+    if (idx->nb_written) {
+        idx->written = av_malloc_array(idx->nb_written, sizeof(*idx->written));
+        if (!idx->written) { ret = AVERROR(ENOMEM); goto fail; }
+        for (unsigned i = 0; i < idx->nb_written; i++) {
+            ret = mov_recovery_read_entry(&idx->written[i], &data, end);
+            if (ret < 0)
+                goto fail;
+        }
+    }
+
+    READ32(idx->nb_pending);
+    if (idx->nb_pending) {
+        idx->pending = av_malloc_array(idx->nb_pending, sizeof(*idx->pending));
+        if (!idx->pending) { ret = AVERROR(ENOMEM); goto fail; }
+        for (unsigned i = 0; i < idx->nb_pending; i++) {
+            ret = mov_recovery_read_entry(&idx->pending[i], &data, end);
+            if (ret < 0)
+                goto fail;
+        }
+    }
+
+    if (data != end) {
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+
+#undef READ32
+#undef READ64
+
+    ffmpeg_mux_recovery_ost_reset(ost);
+    ost->recovery.mov = idx;
+
+    return 0;
+
+fail:
+    mov_recovery_index_free(&idx);
+    return ret;
+}
+
+static int mov_recovery_parse(OutputFile *of, const char *line)
+{
+    const char *arg;
+
+    if (av_strstart(line, "MOVF ", &arg)) {
+        int version;
+        uint64_t mdat_size;
+        if (sscanf(arg, "%d %"SCNu64, &version, &mdat_size) != 2)
+            return AVERROR_INVALIDDATA;
+        if (version != MOV_RECOVERY_VERSION)
+            return AVERROR_INVALIDDATA;
+        of->recovery.have_mov_mdat_size = 1;
+        of->recovery.mov_mdat_size = mdat_size;
+        return 1;
+    }
+
+    if (av_strstart(line, "MOVT ", &arg)) {
+        int stream_index;
+        const char *payload;
+        uint8_t *decoded = NULL;
+        int decoded_size;
+        int consumed;
+        int ret;
+        int payload_len;
+        int max_decoded;
+
+        if (sscanf(arg, "%d %n", &stream_index, &consumed) != 1)
+            return AVERROR_INVALIDDATA;
+
+        payload = arg + consumed;
+        while (*payload == ' ')
+            payload++;
+
+        payload_len = strlen(payload);
+        max_decoded = payload_len ? (payload_len / 4) * 3 + 3 : 1;
+        decoded = av_malloc(max_decoded);
+        if (!decoded)
+            return AVERROR(ENOMEM);
+
+        decoded_size = av_base64_decode(decoded, payload, max_decoded);
+        if (decoded_size < 0) {
+            av_free(decoded);
+            return AVERROR_INVALIDDATA;
+        }
+
+        ret = mov_recovery_parse_track(of, stream_index, decoded,
+                                       decoded + decoded_size);
+        av_free(decoded);
+        if (ret < 0)
+            return ret;
+
+        return 1;
+    }
+
+    return 0;
+}
+
+static int mov_recovery_apply(OutputFile *of)
+{
+    Muxer *mux = mux_from_of(of);
+    AVFormatContext *fc = mux ? mux->fc : NULL;
+    MOVMuxContext *mov;
+
+    if (!fc || !mov_recovery_supported(fc))
+        return 0;
+
+    mov = fc->priv_data;
+    if (!mov)
+        return 0;
+
+    if (of->recovery.have_mov_mdat_size)
+        mov->mdat_size = of->recovery.mov_mdat_size;
+
+    for (int i = 0; i < of->nb_streams && i < mov->nb_streams; i++) {
+        OutputStream *ost = of->streams[i];
+        MOVTrack *track = &mov->tracks[i];
+        struct MovRecoveryIndex *idx = ost ? ost->recovery.mov : NULL;
+        MOVIentry *cluster = NULL;
+        MOVIentry *cluster_written = NULL;
+
+        if (!idx)
+            continue;
+
+        if (idx->nb_pending) {
+            cluster = av_malloc_array(idx->nb_pending, sizeof(*cluster));
+            if (!cluster)
+                return AVERROR(ENOMEM);
+            for (unsigned j = 0; j < idx->nb_pending; j++)
+                mov_recovery_fill_entry(&cluster[j], &idx->pending[j]);
+        }
+
+        if (idx->nb_written) {
+            cluster_written = av_malloc_array(idx->nb_written,
+                                              sizeof(*cluster_written));
+            if (!cluster_written) {
+                av_freep(&cluster);
+                return AVERROR(ENOMEM);
+            }
+            for (unsigned j = 0; j < idx->nb_written; j++)
+                mov_recovery_fill_entry(&cluster_written[j], &idx->written[j]);
+        }
+
+        av_freep(&track->cluster);
+        av_freep(&track->cluster_written);
+
+        track->cluster           = cluster;
+        track->cluster_written   = cluster_written;
+        track->cluster_capacity  = idx->nb_pending;
+        track->entry             = idx->nb_pending;
+        track->entry_written     = idx->nb_written;
+        track->entries_flushed   = idx->entries_flushed;
+        track->sample_count      = idx->sample_count;
+        track->sample_size       = idx->sample_size;
+        track->chunkCount        = idx->chunk_count;
+        track->time              = idx->time;
+        track->track_duration    = idx->track_duration;
+        track->start_dts         = idx->start_dts;
+        track->start_cts         = idx->start_cts;
+        track->end_pts           = idx->end_pts;
+        track->dts_shift         = idx->dts_shift;
+        track->default_duration  = idx->default_duration;
+        track->data_offset       = idx->data_offset;
+
+        track->mode                    = idx->mode;
+        track->flags                   = idx->flags;
+        track->timecode_flags          = idx->timecode_flags;
+        track->has_keyframes           = idx->has_keyframes;
+        track->has_disposable          = idx->has_disposable;
+        track->last_sample_is_subtitle_end = idx->last_sample_is_subtitle_end;
+        track->end_reliable            = idx->end_reliable;
+        track->frag_discont            = idx->frag_discont;
+        track->default_sample_flags    = idx->default_sample_flags;
+        track->default_size            = idx->default_size;
+        if (idx->timescale)
+            track->timescale = idx->timescale;
+
+        mov_recovery_index_free(&ost->recovery.mov);
+    }
+
+    return 0;
+}
+
+#endif /* MOV muxers */
+
+int ffmpeg_mux_recovery_parse(OutputFile *of, const char *line)
+{
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+    int ret = mov_recovery_parse(of, line);
+    if (ret != 0)
+        return ret;
+#endif
+    return 0;
+}
+
+int ffmpeg_mux_recovery_serialize(OutputFile *of, AVBPrint *bp)
+{
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+    int ret = mov_recovery_collect(of, bp);
+    if (ret < 0)
+        return ret;
+#endif
+    return 0;
+}
+
+int ffmpeg_mux_recovery_apply(OutputFile *of)
+{
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+    int ret = mov_recovery_apply(of);
+    if (ret < 0)
+        return ret;
+#endif
+    return 0;
+}
+
+void ffmpeg_mux_recovery_ost_reset(OutputStream *ost)
+{
+#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
+    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
+    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+    mov_recovery_index_free(&ost->recovery.mov);
+#else
+    ost->recovery.mov = NULL;
+#endif
 }
 
 int ffmpeg_mux_checkpoint_flush(OutputFile *of)
@@ -611,6 +1169,12 @@ int mux_check_init(void *arg)
         }
     }
 
+    if (of->recovery.append) {
+        ret = ffmpeg_mux_recovery_apply(of);
+        if (ret < 0)
+            return ret;
+    }
+
     av_dump_format(fc, of->index, fc->url, 1);
     atomic_fetch_add(&nb_output_dumped, 1);
 
@@ -883,6 +1447,8 @@ static void ost_free(OutputStream **post)
     enc_stats_uninit(&ost->enc_stats_pre);
     enc_stats_uninit(&ost->enc_stats_post);
     enc_stats_uninit(&ms->stats);
+
+    ffmpeg_mux_recovery_ost_reset(ost);
 
     av_freep(post);
 }

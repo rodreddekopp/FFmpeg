@@ -1436,11 +1436,11 @@ regular outputs. The file records the last confirmed output size along with
 per-stream decoding progress so that long running encodes can be resumed after
 an unexpected interruption. This option is disabled by default.
 
-Container formats that require accumulated indexing state in order to be
+For container formats that require accumulated indexing state in order to be
 playable, such as @command{mov}/@command{mp4} and the related Smooth Streaming
-profiles, are currently excluded from recovery tracking. When recovery is
-requested for one of these muxers ffmpeg logs a warning and continues without
-creating checkpoints so previously generated fragments remain valid.
+profiles, the recovery sidecar also snapshots muxer indexing metadata. When
+ffmpeg resumes from a checkpoint it restores that state before appending new
+data so the resulting files stay valid across repeated recoveries.
 
 While recovery tracking is active the interactive status line gains an extra
 @code{chkpt=} field, and progress logs emitted through @option{-progress} gain a

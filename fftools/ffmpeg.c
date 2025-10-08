@@ -133,11 +133,6 @@ typedef struct RecoveryState {
     uint64_t last_checkpoint_frame;
 } RecoveryState;
 
-static const char *const recovery_format_blocklist[] = {
-    "mp4", "mov", "m4a", "3gp", "3g2", "mj2", "ism", "ismv",
-    NULL,
-};
-
 static const RecoveryState recovery_state_default = {
     .last_progress_us = AV_NOPTS_VALUE,
 };
@@ -391,14 +386,6 @@ const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
 
 static int recovery_format_supported(const AVOutputFormat *fmt)
 {
-    if (!fmt)
-        return 1;
-
-    for (const char *const *name = recovery_format_blocklist; *name; name++) {
-        if (av_match_name(*name, fmt->name))
-            return 0;
-    }
-
     return 1;
 }
 
@@ -569,6 +556,12 @@ static int recovery_parse_checkpoint(OutputFile *of, char *content,
                     }
                 }
             }
+        } else {
+            int handled = ffmpeg_mux_recovery_parse(of, line);
+            if (handled > 0)
+                continue;
+            if (handled < 0)
+                return handled;
         }
     }
 
@@ -696,6 +689,10 @@ static int recovery_write_snapshot(OutputFile *of, int64_t progress_us,
 
     of->recovery.last_frame = checkpoint_frame;
 
+    ret = ffmpeg_mux_recovery_serialize(of, &bp);
+    if (ret < 0)
+        goto out;
+
     ret = av_bprint_finalize(&bp, &data);
     if (ret < 0)
         return ret;
@@ -707,6 +704,7 @@ static int recovery_write_snapshot(OutputFile *of, int64_t progress_us,
         avio_closep(&pb);
     }
 
+out:
     if (ret < 0)
         av_log(of, AV_LOG_WARNING,
                "Failed to write recovery checkpoint to %s: %s\n",
