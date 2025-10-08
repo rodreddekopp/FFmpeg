@@ -38,9 +38,20 @@
 
 #include "libavformat/avformat.h"
 #include "libavformat/avio.h"
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if (defined(CONFIG_MOV_MUXER)  && CONFIG_MOV_MUXER)  || \
+    (defined(CONFIG_MP4_MUXER)  && CONFIG_MP4_MUXER)  || \
+    (defined(CONFIG_ISMV_MUXER) && CONFIG_ISMV_MUXER) || \
+    (defined(CONFIG_M4A_MUXER)  && CONFIG_M4A_MUXER)  || \
+    (defined(CONFIG_3GP_MUXER)  && CONFIG_3GP_MUXER)  || \
+    (defined(CONFIG_3G2_MUXER)  && CONFIG_3G2_MUXER)  || \
+    (defined(CONFIG_MJ2_MUXER)  && CONFIG_MJ2_MUXER)  || \
+    (defined(CONFIG_ISM_MUXER)  && CONFIG_ISM_MUXER)
+#define ENABLE_MOV_RECOVERY 1
+#else
+#define ENABLE_MOV_RECOVERY 0
+#endif
+
+#if ENABLE_MOV_RECOVERY
 #include "libavformat/movenc.h"
 #endif
 
@@ -67,9 +78,7 @@ static int64_t filesize(AVIOContext *pb)
     return ret;
 }
 
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if ENABLE_MOV_RECOVERY
 
 #define MOV_RECOVERY_VERSION 1
 
@@ -574,9 +583,7 @@ static int mov_recovery_apply(OutputFile *of)
 
 int ffmpeg_mux_recovery_parse(OutputFile *of, const char *line)
 {
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if ENABLE_MOV_RECOVERY
     int ret = mov_recovery_parse(of, line);
     if (ret != 0)
         return ret;
@@ -586,9 +593,7 @@ int ffmpeg_mux_recovery_parse(OutputFile *of, const char *line)
 
 int ffmpeg_mux_recovery_serialize(OutputFile *of, AVBPrint *bp)
 {
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if ENABLE_MOV_RECOVERY
     int ret = mov_recovery_collect(of, bp);
     if (ret < 0)
         return ret;
@@ -598,9 +603,7 @@ int ffmpeg_mux_recovery_serialize(OutputFile *of, AVBPrint *bp)
 
 int ffmpeg_mux_recovery_apply(OutputFile *of)
 {
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if ENABLE_MOV_RECOVERY
     int ret = mov_recovery_apply(of);
     if (ret < 0)
         return ret;
@@ -610,9 +613,7 @@ int ffmpeg_mux_recovery_apply(OutputFile *of)
 
 void ffmpeg_mux_recovery_ost_reset(OutputStream *ost)
 {
-#if CONFIG_MOV_MUXER || CONFIG_MP4_MUXER || CONFIG_ISMV_MUXER || \
-    CONFIG_M4A_MUXER || CONFIG_3GP_MUXER || CONFIG_3G2_MUXER ||    \
-    CONFIG_MJ2_MUXER || CONFIG_ISM_MUXER
+#if ENABLE_MOV_RECOVERY
     mov_recovery_index_free(&ost->recovery.mov);
 #else
     ost->recovery.mov = NULL;
