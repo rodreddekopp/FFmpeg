@@ -847,11 +847,21 @@ static void demux_final_stats(Demuxer *d)
                ds->nb_packets, ds->data_size);
 
         if (ds->decoding_needed) {
+            uint64_t frames = 0;
+            uint64_t errors = 0;
+            uint64_t samples = 0;
+
+            if (ist->decoder) {
+                frames  = atomic_load(&ist->decoder->frames_decoded);
+                errors  = atomic_load(&ist->decoder->decode_errors);
+                samples = atomic_load(&ist->decoder->samples_decoded);
+            }
+
             av_log(f, AV_LOG_VERBOSE,
                    "%"PRIu64" frames decoded; %"PRIu64" decode errors",
-                   ist->decoder->frames_decoded, ist->decoder->decode_errors);
+                   frames, errors);
             if (type == AVMEDIA_TYPE_AUDIO)
-                av_log(f, AV_LOG_VERBOSE, " (%"PRIu64" samples)", ist->decoder->samples_decoded);
+                av_log(f, AV_LOG_VERBOSE, " (%"PRIu64" samples)", samples);
             av_log(f, AV_LOG_VERBOSE, "; ");
         }
 
@@ -1255,6 +1265,7 @@ static DemuxStream *demux_stream_alloc(Demuxer *d, AVStream *st)
     ds->ist.file       = f;
     ds->ist.index      = st->index;
     ds->ist.class      = &input_stream_class;
+    ds->ist.recovery_target_pts_us = AV_NOPTS_VALUE;
 
     snprintf(ds->log_name, sizeof(ds->log_name), "%cist#%d:%d/%s",
              type_str ? *type_str : '?', d->f.index, st->index,

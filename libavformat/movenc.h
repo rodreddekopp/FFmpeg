@@ -299,4 +299,6 @@ int ff_mov_add_hinted_packet(AVFormatContext *s, AVPacket *pkt,
                              uint8_t *sample_data, int sample_size);
 void ff_mov_close_hinting(MOVTrack *track);
 
+int ff_mov_checkpoint_trailer(AVFormatContext *s);
+
 #endif /* AVFORMAT_MOVENC_H */

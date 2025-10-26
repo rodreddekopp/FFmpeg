@@ -1429,6 +1429,50 @@ For example, log progress information to stdout:
 ffmpeg -progress pipe:1 -i in.mkv out.mkv
 @end example
 
+@item -auto_recovery @var{bool} (@emph{global})
+Enable periodic persistence of recovery checkpoints for each output file. When
+enabled, ffmpeg writes a sidecar file with the suffix @code{.ffrecovery} next to
+regular outputs. The file records the last confirmed output size along with
+per-stream decoding progress so that long running encodes can be resumed after
+an unexpected interruption. This option is disabled by default.
+
+For container formats that require accumulated indexing state in order to be
+playable, such as @command{mov}/@command{mp4} and the related Smooth Streaming
+profiles, the recovery sidecar also snapshots muxer indexing metadata. When
+ffmpeg resumes from a checkpoint it restores that state before appending new
+data so the resulting files stay valid across repeated recoveries.
+
+While recovery tracking is active the interactive status line gains an extra
+@code{chkpt=} field, and progress logs emitted through @option{-progress} gain a
+matching @code{checkpoint_frame} entry. Both values report the video frame
+number captured in the most recent checkpoint so operators can confirm that the
+periodic flushes are keeping up with the encode.
+
+@item -recovery_interval @var{duration} (@emph{global})
+Set the wall-clock interval used by @option{-auto_recovery}. The default value
+is @code{5m}. A checkpoint is only written when encoding progress is updated,
+so lowering the interval below the @option{-stats_period} will not produce more
+frequent writes.
+
+Whenever a checkpoint is written the muxers flush their pending output buffers
+before the recovery file is updated, ensuring that the on-disk output is always
+consistent with the recorded file size even if the host loses power immediately
+afterward. The sidecar also records the cumulative encoding time so resuming a
+recovered job continues reporting accurate @code{elapsed} and @code{fps}
+statistics.
+
+@item -auto_resume @var{bool} (@emph{global})
+Automatically detect and reuse recovery checkpoints created by a previous run
+when opening an output file. ffmpeg seeks the corresponding inputs to the last
+recorded position and continues writing to the existing output file instead of
+truncating it. This option is enabled by default.
+
+When @option{-auto_resume} is used without @option{-auto_recovery}, ffmpeg only
+attempts to reuse checkpoints that were already created by an earlier command
+invocation. If no matching @file{.ffrecovery} sidecar exists next to the
+destination, the output is opened normally and a warning is logged to indicate
+that no recovery point could be found.
+
 @anchor{stdin option}
 @item -stdin
 Enable interaction on standard input. On by default unless standard input is
@@ -1439,6 +1483,13 @@ Disabling interaction on standard input is useful, for example, if
 ffmpeg is in the background process group. Roughly the same result can
 be achieved with @code{ffmpeg ... < /dev/null} but it requires a
 shell.
+
+When interaction is enabled, several single-key commands are available.
+For example, press @code{q} to gracefully stop transcoding, @code{p} to
+toggle between pausing and resuming the active transcode, and
+@code{?} to show the list of supported commands. On POSIX systems,
+sending @code{SIGUSR2} to the @command{ffmpeg} process will toggle the
+same pause/resume behaviour, which is convenient for remote automation.
 
 @item -debug_ts (@emph{global})
 Print timestamp/latency information. It is off by default. This option is

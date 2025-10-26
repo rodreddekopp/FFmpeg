@@ -452,9 +452,11 @@ typedef struct Decoder {
     int              subtitle_header_size;
 
     // number of frames/samples retrieved from the decoder
-    uint64_t         frames_decoded;
-    uint64_t         samples_decoded;
-    uint64_t         decode_errors;
+    atomic_uint_least64_t frames_decoded;
+    atomic_uint_least64_t samples_decoded;
+    atomic_uint_least64_t decode_errors;
+
+    atomic_int_fast64_t   last_pts_us;
 } Decoder;
 
 typedef struct InputStream {
@@ -489,6 +491,8 @@ typedef struct InputStream {
      * currently video and audio only */
     InputFilter         **filters;
     int                nb_filters;
+
+    int64_t              recovery_target_pts_us;
 } InputStream;
 
 typedef struct InputFile {
@@ -605,6 +609,8 @@ enum CroppingType {
     CROP_CONTAINER,
 };
 
+struct MovRecoveryIndex;
+
 typedef struct OutputStream {
     const AVClass *class;
 
@@ -659,6 +665,10 @@ typedef struct OutputStream {
      * subtitles utilizing fix_sub_duration at random access points.
      */
     unsigned int fix_sub_duration_heartbeat;
+
+    struct {
+        struct MovRecoveryIndex *mov;
+    } recovery;
 } OutputStream;
 
 typedef struct OutputFile {
@@ -675,6 +685,18 @@ typedef struct OutputFile {
     int64_t start_time;      ///< start time in microseconds == AV_TIME_BASE units
 
     int bitexact;
+
+    char *recovery_path;
+    struct {
+        int     enabled;
+        int     append;
+        int64_t file_size;
+        int64_t progress_us;
+        int64_t elapsed_us;
+        uint64_t last_frame;
+        uint64_t mov_mdat_size;
+        int      have_mov_mdat_size;
+    } recovery;
 } OutputFile;
 
 // optionally attached as opaque_ref to decoded AVFrames
@@ -736,6 +758,10 @@ extern int64_t stats_period;
 extern int stdin_interaction;
 extern AVIOContext *progress_avio;
 extern float max_error_rate;
+
+extern int recovery_enabled;
+extern int recovery_resume_enabled;
+extern int64_t recovery_interval;
 
 extern char *filter_nbthreads;
 extern int filter_complex_nbthreads;
@@ -810,6 +836,11 @@ void fg_send_command(FilterGraph *fg, double time, const char *target,
                      const char *command, const char *arg, int all_filters);
 
 int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch);
+
+int recovery_prepare_output(OutputFile *of, AVFormatContext *oc,
+                            const char *filename, int *open_flags);
+void recovery_checkpoint_tick(int is_last_report, int64_t wallclock_us,
+                              int64_t progress_us, int64_t elapsed_us);
 
 void enc_stats_write(OutputStream *ost, EncStats *es,
                      const AVFrame *frame, const AVPacket *pkt,

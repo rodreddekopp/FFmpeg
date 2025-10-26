@@ -18,7 +18,20 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "config.h"
+
+#include <errno.h>
 #include <string.h>
+
+#if HAVE_UNISTD_H
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
+#if defined(_WIN32)
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 #include "cmdutils.h"
 #include "ffmpeg.h"
@@ -64,6 +77,45 @@ static int check_opt_bitexact(void *ctx, const AVDictionary *opts,
         return !!(val & flag);
     }
     return 0;
+}
+
+int ffmpeg_truncate_output_tail(const char *filename, int64_t size)
+{
+    if (size < 0)
+        return AVERROR(EINVAL);
+
+#if HAVE_TRUNC
+    if (truncate(filename, (off_t)size) < 0)
+        return AVERROR(errno);
+    return 0;
+#elif defined(_WIN32)
+    int fd = _open(filename, _O_RDWR | _O_BINARY);
+    int ret;
+
+    if (fd < 0)
+        return AVERROR(errno);
+
+#if defined(_WIN32) && !defined(__MINGW32__)
+    ret = _chsize_s(fd, size);
+    if (ret) {
+        ret = AVERROR(errno);
+        _close(fd);
+        return ret;
+    }
+#else
+    ret = _chsize(fd, size);
+    if (ret) {
+        ret = AVERROR(errno);
+        _close(fd);
+        return ret;
+    }
+#endif
+
+    _close(fd);
+    return 0;
+#else
+    return AVERROR(ENOSYS);
+#endif
 }
 
 static int choose_encoder(const OptionsContext *o, AVFormatContext *s,
@@ -3357,19 +3409,46 @@ int of_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         return AVERROR(EINVAL);
     }
 
+    int open_flags = AVIO_FLAG_WRITE;
+
+    err = recovery_prepare_output(of, oc, filename, &open_flags);
+    if (err < 0)
+        return err;
+
     if (!(oc->oformat->flags & AVFMT_NOFILE)) {
         /* test if it already exists to avoid losing precious files */
-        err = assert_file_overwrite(filename);
-        if (err < 0)
-            return err;
+        if (!of->recovery.append) {
+            err = assert_file_overwrite(filename);
+            if (err < 0)
+                return err;
+        }
 
         /* open the file */
-        if ((err = avio_open2(&oc->pb, filename, AVIO_FLAG_WRITE,
+        if ((err = avio_open2(&oc->pb, filename, open_flags,
                               &oc->interrupt_callback,
                               &mux->opts)) < 0) {
             av_log(mux, AV_LOG_FATAL, "Error opening output %s: %s\n",
                    filename, av_err2str(err));
             return err;
+        }
+        if (of->recovery.append) {
+            int truncate_ret;
+            int64_t seek_ret;
+
+            truncate_ret = ffmpeg_truncate_output_tail(filename, of->recovery.file_size);
+            if (truncate_ret < 0 && truncate_ret != AVERROR(ENOSYS)) {
+                av_log(mux, AV_LOG_WARNING,
+                       "Unable to truncate %s to %"PRId64" bytes: %s\n",
+                       filename, of->recovery.file_size, av_err2str(truncate_ret));
+            }
+
+            seek_ret = avio_seek(oc->pb, of->recovery.file_size, SEEK_SET);
+            if (seek_ret < 0) {
+                av_log(mux, AV_LOG_FATAL,
+                       "Seeking to recovery offset failed for %s: %s\n",
+                       filename, av_err2str((int)seek_ret));
+                return (int)seek_ret;
+            }
         }
     } else if (strcmp(oc->oformat->name, "image2")==0 && !av_filename_number_test(filename)) {
         err = assert_file_overwrite(filename);

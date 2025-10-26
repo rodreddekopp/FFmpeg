@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -304,6 +305,7 @@ struct Scheduler {
     int                 sdp_auto;
 
     enum SchedulerState state;
+    int                 paused;
     atomic_int          terminate;
 
     pthread_mutex_t     schedule_lock;
@@ -1334,6 +1336,23 @@ static void schedule_update_locked(Scheduler *sch)
     if (atomic_load(&sch->terminate))
         return;
 
+    if (sch->paused) {
+        atomic_store(&sch->last_dts, trailing_dts(sch, 0));
+
+        for (unsigned type = 0; type < 2; type++) {
+            for (unsigned i = 0; i < (type ? sch->nb_filters : sch->nb_demux); i++) {
+                SchWaiter *w = type ? &sch->filters[i].waiter : &sch->demux[i].waiter;
+                if (!atomic_load(&w->choked)) {
+                    waiter_set(w, 1);
+                    if (!type)
+                        choke_demux(sch, i, 1);
+                }
+            }
+        }
+
+        return;
+    }
+
     dts = trailing_dts(sch, 0);
 
     atomic_store(&sch->last_dts, dts);
@@ -1694,6 +1713,48 @@ int sch_start(Scheduler *sch)
     return 0;
 fail:
     sch_stop(sch, NULL);
+    return ret;
+}
+
+int sch_pause(Scheduler *sch)
+{
+    int ret = 0;
+
+    pthread_mutex_lock(&sch->schedule_lock);
+
+    if (sch->state != SCH_STATE_STARTED) {
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+
+    if (!sch->paused) {
+        sch->paused = 1;
+        schedule_update_locked(sch);
+    }
+
+end:
+    pthread_mutex_unlock(&sch->schedule_lock);
+    return ret;
+}
+
+int sch_resume(Scheduler *sch)
+{
+    int ret = 0;
+
+    pthread_mutex_lock(&sch->schedule_lock);
+
+    if (sch->state != SCH_STATE_STARTED) {
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+
+    if (sch->paused) {
+        sch->paused = 0;
+        schedule_update_locked(sch);
+    }
+
+end:
+    pthread_mutex_unlock(&sch->schedule_lock);
     return ret;
 }
 

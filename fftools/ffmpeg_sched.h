@@ -134,6 +134,8 @@ Scheduler *sch_alloc(void);
 void sch_free(Scheduler **sch);
 
 int sch_start(Scheduler *sch);
+int sch_pause(Scheduler *sch);
+int sch_resume(Scheduler *sch);
 int sch_stop(Scheduler *sch, int64_t *finish_ts);
 
 /**
